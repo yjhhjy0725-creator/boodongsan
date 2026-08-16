@@ -238,6 +238,8 @@
     // 데이터 저장소 (서버 동기화 반영)
     let buildings = [];
     let zones = [];
+    let pendingDeletedBuildings = {};
+    let pendingDeletedZones = {};
     let currentTab = 'buildings';
     let buildingMarkers = [];
     let zoneFeatureGroup = L.featureGroup().addTo(map);
@@ -249,38 +251,111 @@
     let tempImageBase64 = null;
     let tempZoneImageBase64 = null;
 
-    // 서버(구글 시트) 데이터 불러오기 함수
+    // ============================================================
+    // 서버 데이터 동기화
+    // ============================================================
+
+    function makeId(prefix) {
+        if (window.crypto && crypto.randomUUID) {
+            return prefix + '_' + crypto.randomUUID();
+        }
+        return prefix + '_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+    }
+
+    function touchBuilding(building) {
+        building.updatedAt = Date.now();
+        return building;
+    }
+
+    function touchZone(zone) {
+        zone.updatedAt = Date.now();
+        return zone;
+    }
+
+    function markBuildingDeleted(id) {
+        pendingDeletedBuildings[id] = Date.now();
+    }
+
+    function markZoneDeleted(id) {
+        pendingDeletedZones[id] = Date.now();
+    }
+
     async function loadDataFromServer() {
         if (!WEB_APP_URL) return;
+
         try {
-            const response = await fetch(`${WEB_APP_URL}?action=getData`);
+            const response = await fetch(
+                `${WEB_APP_URL}?action=getData&_=${Date.now()}`,
+                { method: 'GET', cache: 'no-store' }
+            );
+
             const result = await response.json();
+
             if (result.status === "success") {
-                if (result.buildings) buildings = result.buildings;
-                if (result.zones) zones = result.zones;
+                buildings = Array.isArray(result.buildings) ? result.buildings : [];
+                zones = Array.isArray(result.zones) ? result.zones : [];
+
+                buildings.forEach(b => {
+                    if (!b.updatedAt) b.updatedAt = 1;
+                    if (!b.floors) b.floors = {};
+                });
+
+                zones.forEach(z => {
+                    if (!z.updatedAt) z.updatedAt = 1;
+                });
+
+                pendingDeletedBuildings = {};
+                pendingDeletedZones = {};
+
+                localStorage.setItem('seoul_buildings_v6', JSON.stringify(buildings));
+                localStorage.setItem('seoul_zones_v6', JSON.stringify(zones));
+
                 renderList();
+
+                console.log(`서버 동기화 완료: 건물 ${buildings.length}개 / 구역 ${zones.length}개`);
+            } else {
+                console.error("서버 응답 오류:", result.message);
             }
         } catch (error) {
-            console.error("데이터 동기화 실패 (로컬 데이터 유지):", error);
+            console.error("서버 데이터 불러오기 실패. 로컬 데이터 유지:", error);
         }
     }
 
-    // 서버로 데이터 저장 함수
     async function saveData() {
-        // 로컬에 백업 저장
-        localStorage.setItem('seoul_buildings_v5', JSON.stringify(buildings)); 
-        localStorage.setItem('seoul_zones_v5', JSON.stringify(zones));
+        localStorage.setItem('seoul_buildings_v6', JSON.stringify(buildings));
+        localStorage.setItem('seoul_zones_v6', JSON.stringify(zones));
 
         if (!WEB_APP_URL) return;
+
+        const payload = {
+            action: 'saveData',
+            buildings: buildings,
+            zones: zones,
+            deletedBuildings: Object.keys(pendingDeletedBuildings).map(id => ({
+                id: id,
+                deletedAt: pendingDeletedBuildings[id]
+            })),
+            deletedZones: Object.keys(pendingDeletedZones).map(id => ({
+                id: id,
+                deletedAt: pendingDeletedZones[id]
+            }))
+        };
+
         try {
             await fetch(WEB_APP_URL, {
                 method: 'POST',
                 mode: 'no-cors',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ action: 'saveData', buildings: buildings, zones: zones })
+                headers: {
+                    'Content-Type': 'text/plain;charset=utf-8'
+                },
+                body: JSON.stringify(payload)
             });
+
+            pendingDeletedBuildings = {};
+            pendingDeletedZones = {};
+            console.log("서버 저장 요청 완료");
         } catch (error) {
-            console.error("서버 전송 중 오류 발생:", error);
+            console.error("서버 저장 요청 실패:", error);
         }
     }
 
@@ -339,14 +414,15 @@
                     b.name = title; 
                     b.totalFloors = tFloors; 
                     if(imgData !== null) b.imageUrl = imgData; 
-                    b.linkUrl = linkUrl; 
+                    b.linkUrl = linkUrl;
+                    touchBuilding(b);
                 }
             } else {
                 buildings.push({
-                    id: 'B_' + Date.now().toString(),
+                    id: makeId('B'),
                     lat: parseFloat(document.getElementById('build-lat').value),
                     lng: parseFloat(document.getElementById('build-lng').value),
-                    name: title, totalFloors: tFloors, imageUrl: imgData || '', linkUrl: linkUrl, floors: {}
+                    name: title, totalFloors: tFloors, imageUrl: imgData || '', linkUrl: linkUrl, floors: {}, updatedAt: Date.now()
                 });
             }
             saveData(); closeModal('modal-building-create');
@@ -425,11 +501,23 @@
             return: parseFloat(document.getElementById('floor-return').value) || 0,
             comment: document.getElementById('floor-comment').value
         };
+        touchBuilding(b);
         saveData(); closeModal('modal-floor-edit'); openBuildingView(currentBuildingId); renderList();
     });
 
     window.deleteFloorData = function() {
-        if(confirm('층 데이터를 삭제할까요?')) { delete buildings.find(b => b.id === currentBuildingId).floors[currentFloor]; saveData(); closeModal('modal-floor-edit'); openBuildingView(currentBuildingId); renderList(); }
+        if (!confirm('층 데이터를 삭제할까요?')) return;
+
+        const b = buildings.find(b => b.id === currentBuildingId);
+        if (!b) return;
+
+        delete b.floors[currentFloor];
+        touchBuilding(b);
+        saveData();
+
+        closeModal('modal-floor-edit');
+        openBuildingView(currentBuildingId);
+        renderList();
     };
     window.editBuildingBasic = function() {
         const b = buildings.find(b => b.id === currentBuildingId);
@@ -441,7 +529,14 @@
         closeModal('modal-building-view'); openModal('modal-building-create');
     };
     window.deleteCurrentBuilding = function() {
-        if(confirm('건물 전체를 삭제할까요?')) { buildings = buildings.filter(b => b.id !== currentBuildingId); saveData(); closeModal('modal-building-view'); renderList(); }
+        if (!confirm('건물 전체를 삭제할까요?')) return;
+
+        markBuildingDeleted(currentBuildingId);
+        buildings = buildings.filter(b => b.id !== currentBuildingId);
+
+        saveData();
+        closeModal('modal-building-view');
+        renderList();
     };
 
     /* =================================================================
@@ -467,13 +562,14 @@
                     z.name = name; 
                     if(imgData !== null) z.imageUrl = imgData; 
                     z.linkUrl = link; 
-                    z.desc = desc; 
+                    z.desc = desc;
+                    touchZone(z);
                 }
             } else if (tempLayer) {
                 zones.push({
-                    id: 'Z_' + Date.now().toString(),
+                    id: makeId('Z'),
                     name: name, imageUrl: imgData || '', linkUrl: link, desc: desc,
-                    geojson: tempLayer.toGeoJSON()
+                    geojson: tempLayer.toGeoJSON(), updatedAt: Date.now()
                 });
                 map.removeLayer(tempLayer); tempLayer = null;
             }
@@ -494,7 +590,15 @@
         tempLayer = null; editingZoneId = null; closeModal('modal-zone-info');
     };
 
-    map.on('pm:remove', (e) => { if(e.layer.zoneId) { zones = zones.filter(z => z.id !== e.layer.zoneId); saveData(); renderList(); } });
+    map.on('pm:remove', (e) => {
+        if (!e.layer.zoneId) return;
+
+        markZoneDeleted(e.layer.zoneId);
+        zones = zones.filter(z => z.id !== e.layer.zoneId);
+
+        saveData();
+        renderList();
+    });
 
     function attachZoneEvents(layer, zoneData) {
         layer.zoneId = zoneData.id;
@@ -508,7 +612,14 @@
             document.getElementById('zone-img-file').value = '';
             openModal('modal-zone-info');
         });
-        layer.on('pm:edit', (e) => { const z = zones.find(item => item.id === zoneData.id); if(z) { z.geojson = e.layer.toGeoJSON(); saveData(); } });
+        layer.on('pm:edit', (e) => {
+            const z = zones.find(item => item.id === zoneData.id);
+            if (z) {
+                z.geojson = e.layer.toGeoJSON();
+                touchZone(z);
+                saveData();
+            }
+        });
     }
 
     /* =================================================================
@@ -522,7 +633,18 @@
         renderList();
     }
     window.clearCurrentData = function() {
-        if(confirm(`현재 탭의 모든 데이터를 삭제하시겠습니까?`)) { if(currentTab === 'buildings') buildings = []; else zones = []; saveData(); renderList(); }
+        if (!confirm('현재 탭의 모든 데이터를 삭제하시겠습니까?')) return;
+
+        if (currentTab === 'buildings') {
+            buildings.forEach(b => markBuildingDeleted(b.id));
+            buildings = [];
+        } else {
+            zones.forEach(z => markZoneDeleted(z.id));
+            zones = [];
+        }
+
+        saveData();
+        renderList();
     }
 
     function renderList() {
@@ -597,6 +719,18 @@
 
     // 페이지 로드시 서버에서 최신 데이터를 가져옴
     loadDataFromServer();
+
+    // 다른 사용자의 변경사항을 주기적으로 반영
+    // 입력/편집 중에는 화면을 덮어쓰지 않도록 모달이 열려 있지 않을 때만 실행
+    setInterval(() => {
+        const modalOpen = document.querySelector('.modal.active');
+        const drawingMode = map.pm.globalDrawModeEnabled();
+        const editMode = map.pm.globalEditModeEnabled();
+
+        if (!modalOpen && !drawingMode && !editMode) {
+            loadDataFromServer();
+        }
+    }, 30000);
 </script>
 </body>
 </html>

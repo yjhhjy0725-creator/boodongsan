@@ -203,8 +203,8 @@
 <script src="https://unpkg.com/@geoman-io/leaflet-geoman-free@latest/dist/leaflet-geoman.min.js"></script>
 
 <script>
-    // 🔗 구글 시트 웹 앱 URL 설정 (이 주소를 통해 서버와 데이터를 동기화합니다)
-    const WEB_APP_URL = "https://script.google.com/macros/s/AKfycbwcuecE-bd0v5uKWDunN4hjGskhB8SD0scG7C8Fplee8yuCCBhaSyvOpbS1ME9lWyDW/exec";
+    // 🔗 Google Apps Script Web App URL
+    const WEB_APP_URL = "https://script.google.com/macros/s/AKfycbxwjLrR0znCJG7m1lxxyi4qoQ53jSVu8ithnHSBIE_LROXA4miTZVg68LAvXssTV7B8/exec";
 
     const map = L.map('map', { zoomControl: false }).setView([37.5300, 126.9800], 13);
     L.control.zoom({ position: 'bottomright' }).addTo(map);
@@ -235,11 +235,9 @@
     setTimeout(() => { map.invalidateSize(); }, 200);
     window.addEventListener('resize', () => { map.invalidateSize(); });
 
-    // 데이터 저장소 (서버 동기화 반영)
+    // 데이터 저장소
     let buildings = [];
     let zones = [];
-    let pendingDeletedBuildings = {};
-    let pendingDeletedZones = {};
     let currentTab = 'buildings';
     let buildingMarkers = [];
     let zoneFeatureGroup = L.featureGroup().addTo(map);
@@ -251,9 +249,15 @@
     let tempImageBase64 = null;
     let tempZoneImageBase64 = null;
 
-    // ============================================================
-    // 서버 데이터 동기화
-    // ============================================================
+    // 동기화 상태
+    let isSyncing = false;
+    let syncTimer = null;
+    let lastServerSync = 0;
+    let pendingDeletedBuildings = {};
+    let pendingDeletedZones = {};
+    let localChangeVersion = 0;
+    let saveQueue = Promise.resolve();
+    let lastLoadedVersion = 0;
 
     function makeId(prefix) {
         if (window.crypto && crypto.randomUUID) {
@@ -262,115 +266,233 @@
         return prefix + '_' + Date.now() + '_' + Math.random().toString(36).slice(2);
     }
 
+    function markLocalChange() {
+        localChangeVersion++;
+    }
+
     function touchBuilding(building) {
         building.updatedAt = Date.now();
+        markLocalChange();
         return building;
     }
 
     function touchZone(zone) {
         zone.updatedAt = Date.now();
+        markLocalChange();
         return zone;
     }
 
     function markBuildingDeleted(id) {
-        pendingDeletedBuildings[id] = Date.now();
+        if (id) {
+            pendingDeletedBuildings[id] = Date.now();
+            markLocalChange();
+        }
     }
 
     function markZoneDeleted(id) {
-        pendingDeletedZones[id] = Date.now();
+        if (id) {
+            pendingDeletedZones[id] = Date.now();
+            markLocalChange();
+        }
     }
 
-    async function loadDataFromServer() {
-        if (!WEB_APP_URL) return;
+    function normalizeData() {
+        buildings = Array.isArray(buildings) ? buildings : [];
+        zones = Array.isArray(zones) ? zones : [];
 
+        buildings.forEach((b, index) => {
+            if (!b.id) b.id = makeId('B');
+            if (!b.floors || typeof b.floors !== 'object') b.floors = {};
+            if (!b.updatedAt) b.updatedAt = index + 1;
+        });
+
+        zones.forEach((z, index) => {
+            if (!z.id) z.id = makeId('Z');
+            if (!z.updatedAt) z.updatedAt = index + 1;
+        });
+    }
+
+    function saveLocalBackup() {
         try {
-            const response = await fetch(
-                `${WEB_APP_URL}?action=getData&_=${Date.now()}`,
-                { method: 'GET', cache: 'no-store' }
-            );
+            localStorage.setItem('seoul_buildings_v6', JSON.stringify(buildings));
+            localStorage.setItem('seoul_zones_v6', JSON.stringify(zones));
+        } catch (e) {
+            console.warn('로컬 백업 저장 실패:', e);
+        }
+    }
+
+    // 서버에서 최신 전체 데이터를 읽는다.
+    async function loadDataFromServer(showError = false) {
+        if (!WEB_APP_URL || isSyncing) return false;
+
+        isSyncing = true;
+        try {
+            const response = await fetch(`${WEB_APP_URL}?action=getData&_=${Date.now()}`, {
+                method: 'GET',
+                cache: 'no-store'
+            });
+
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
             const result = await response.json();
 
-            if (result.status === "success") {
-                buildings = Array.isArray(result.buildings) ? result.buildings : [];
-                zones = Array.isArray(result.zones) ? result.zones : [];
-
-                buildings.forEach(b => {
-                    if (!b.updatedAt) b.updatedAt = 1;
-                    if (!b.floors) b.floors = {};
-                });
-
-                zones.forEach(z => {
-                    if (!z.updatedAt) z.updatedAt = 1;
-                });
-
-                pendingDeletedBuildings = {};
-                pendingDeletedZones = {};
-
-                localStorage.setItem('seoul_buildings_v6', JSON.stringify(buildings));
-                localStorage.setItem('seoul_zones_v6', JSON.stringify(zones));
-
-                renderList();
-
-                console.log(`서버 동기화 완료: 건물 ${buildings.length}개 / 구역 ${zones.length}개`);
-            } else {
-                console.error("서버 응답 오류:", result.message);
+            if (result.status !== 'success') {
+                throw new Error(result.message || '서버가 오류를 반환했습니다.');
             }
-        } catch (error) {
-            console.error("서버 데이터 불러오기 실패. 로컬 데이터 유지:", error);
-        }
-    }
 
-    async function saveData() {
-        localStorage.setItem('seoul_buildings_v6', JSON.stringify(buildings));
-        localStorage.setItem('seoul_zones_v6', JSON.stringify(zones));
-
-        if (!WEB_APP_URL) return;
-
-        const payload = {
-            action: 'saveData',
-            buildings: buildings,
-            zones: zones,
-            deletedBuildings: Object.keys(pendingDeletedBuildings).map(id => ({
-                id: id,
-                deletedAt: pendingDeletedBuildings[id]
-            })),
-            deletedZones: Object.keys(pendingDeletedZones).map(id => ({
-                id: id,
-                deletedAt: pendingDeletedZones[id]
-            }))
-        };
-
-        try {
-            await fetch(WEB_APP_URL, {
-                method: 'POST',
-                mode: 'no-cors',
-                headers: {
-                    'Content-Type': 'text/plain;charset=utf-8'
-                },
-                body: JSON.stringify(payload)
-            });
-
+            buildings = Array.isArray(result.buildings) ? result.buildings : [];
+            zones = Array.isArray(result.zones) ? result.zones : [];
+            normalizeData();
+            saveLocalBackup();
             pendingDeletedBuildings = {};
             pendingDeletedZones = {};
-            console.log("서버 저장 요청 완료");
+            lastServerSync = Date.now();
+            lastLoadedVersion = localChangeVersion;
+            renderList();
+            return true;
         } catch (error) {
-            console.error("서버 저장 요청 실패:", error);
+            console.error('서버 데이터 불러오기 실패:', error);
+            if (showError) alert('서버 데이터를 불러오지 못했습니다.\n\n' + error.message);
+            return false;
+        } finally {
+            isSyncing = false;
         }
     }
 
+    // 현재 변경사항을 서버에 전송한다.
+    // 서버는 ID + updatedAt 기준으로 병합하므로 여러 기기의 데이터를 보존한다.
+    function saveData() {
+        // 저장 요청을 브라우저 안에서도 순서대로 처리한다.
+        saveQueue = saveQueue
+            .catch(() => {})
+            .then(async () => {
+                normalizeData();
+                saveLocalBackup();
+
+                if (!WEB_APP_URL) return false;
+
+                const versionAtStart = localChangeVersion;
+
+                const payload = {
+                    action: 'saveData',
+                    buildings: JSON.parse(JSON.stringify(buildings)),
+                    zones: JSON.parse(JSON.stringify(zones)),
+                    deletedBuildings: Object.keys(pendingDeletedBuildings).map(id => ({
+                        id: id,
+                        deletedAt: pendingDeletedBuildings[id]
+                    })),
+                    deletedZones: Object.keys(pendingDeletedZones).map(id => ({
+                        id: id,
+                        deletedAt: pendingDeletedZones[id]
+                    }))
+                };
+
+                try {
+                    const response = await fetch(WEB_APP_URL, {
+                        method: 'POST',
+                        mode: 'cors',
+                        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}`);
+                    }
+
+                    let result = null;
+                    try {
+                        result = await response.json();
+                    } catch (e) {}
+
+                    if (result && result.status === 'error') {
+                        throw new Error(result.message || '서버 저장 오류');
+                    }
+
+                    // 저장이 시작된 이후 새로운 수정이 없을 때만
+                    // 서버의 최종 병합 상태로 화면을 갱신한다.
+                    if (versionAtStart === localChangeVersion) {
+                        pendingDeletedBuildings = {};
+                        pendingDeletedZones = {};
+                        lastServerSync = Date.now();
+                        await loadDataFromServer(false);
+                    }
+
+                    return true;
+                } catch (error) {
+                    console.error('서버 저장 요청 실패:', error);
+                    return false;
+                }
+            });
+
+        return saveQueue;
+    }
+
+    // 사용자가 아무 편집도 하지 않을 때만 주기적으로 최신 데이터를 가져온다.
+    function startAutoSync() {
+        if (syncTimer) clearInterval(syncTimer);
+
+        syncTimer = setInterval(async () => {
+            const modalOpen = document.querySelector('.modal.active');
+            const drawing = map.pm.globalDrawModeEnabled();
+            const editing = map.pm.globalEditModeEnabled();
+            const removing = map.pm.globalRemovalModeEnabled();
+
+            if (!modalOpen && !drawing && !editing && !removing && !isSyncing && localChangeVersion === lastLoadedVersion) {
+                await loadDataFromServer(false);
+            }
+        }, 20000);
+    }
     function openModal(id) { document.getElementById(id).classList.add('active'); }
     function closeModal(id) { document.getElementById(id).classList.remove('active'); }
 
+    // 이미지가 Google Sheet 셀 제한을 넘지 않도록 브라우저에서 압축한다.
+    // 기능은 그대로 유지하면서 저장 안정성을 높인다.
     function handleImageUpload(fileInput, callback) {
         const file = fileInput.files[0];
-        if (file) {
-            const reader = new FileReader();
-            reader.onload = function(e) { callback(e.target.result); };
-            reader.readAsDataURL(file);
-        } else {
+        if (!file) {
             callback(null);
+            return;
         }
+
+        const reader = new FileReader();
+
+        reader.onload = function(e) {
+            const img = new Image();
+
+            img.onload = function() {
+                const maxSize = 900;
+                const scale = Math.min(1, maxSize / Math.max(img.width, img.height));
+                const width = Math.max(1, Math.round(img.width * scale));
+                const height = Math.max(1, Math.round(img.height * scale));
+
+                const canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = height;
+
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0, width, height);
+
+                // 50,000자 셀 제한을 고려해 45,000자 이하를 목표로 한다.
+                let quality = 0.72;
+                let dataUrl = canvas.toDataURL('image/jpeg', quality);
+
+                while (dataUrl.length > 45000 && quality > 0.35) {
+                    quality -= 0.05;
+                    dataUrl = canvas.toDataURL('image/jpeg', quality);
+                }
+
+                callback(dataUrl);
+            };
+
+            img.onerror = function() {
+                // 이미지 압축이 실패한 경우 원본을 사용
+                callback(e.target.result);
+            };
+
+            img.src = e.target.result;
+        };
+
+        reader.readAsDataURL(file);
     }
 
     document.getElementById('build-img-file').addEventListener('change', function() {
@@ -422,8 +544,10 @@
                     id: makeId('B'),
                     lat: parseFloat(document.getElementById('build-lat').value),
                     lng: parseFloat(document.getElementById('build-lng').value),
-                    name: title, totalFloors: tFloors, imageUrl: imgData || '', linkUrl: linkUrl, floors: {}, updatedAt: Date.now()
+                    name: title, totalFloors: tFloors, imageUrl: imgData || '', linkUrl: linkUrl, floors: {},
+                    updatedAt: Date.now()
                 });
+                markLocalChange();
             }
             saveData(); closeModal('modal-building-create');
             if(currentBuildingId) openBuildingView(currentBuildingId);
@@ -506,18 +630,16 @@
     });
 
     window.deleteFloorData = function() {
-        if (!confirm('층 데이터를 삭제할까요?')) return;
-
-        const b = buildings.find(b => b.id === currentBuildingId);
-        if (!b) return;
-
-        delete b.floors[currentFloor];
-        touchBuilding(b);
-        saveData();
-
-        closeModal('modal-floor-edit');
-        openBuildingView(currentBuildingId);
-        renderList();
+        if(confirm('층 데이터를 삭제할까요?')) {
+            const b = buildings.find(b => b.id === currentBuildingId);
+            if (!b) return;
+            delete b.floors[currentFloor];
+            touchBuilding(b);
+            saveData();
+            closeModal('modal-floor-edit');
+            openBuildingView(currentBuildingId);
+            renderList();
+        }
     };
     window.editBuildingBasic = function() {
         const b = buildings.find(b => b.id === currentBuildingId);
@@ -529,14 +651,13 @@
         closeModal('modal-building-view'); openModal('modal-building-create');
     };
     window.deleteCurrentBuilding = function() {
-        if (!confirm('건물 전체를 삭제할까요?')) return;
-
-        markBuildingDeleted(currentBuildingId);
-        buildings = buildings.filter(b => b.id !== currentBuildingId);
-
-        saveData();
-        closeModal('modal-building-view');
-        renderList();
+        if(confirm('건물 전체를 삭제할까요?')) {
+            markBuildingDeleted(currentBuildingId);
+            buildings = buildings.filter(b => b.id !== currentBuildingId);
+            saveData();
+            closeModal('modal-building-view');
+            renderList();
+        }
     };
 
     /* =================================================================
@@ -569,8 +690,10 @@
                 zones.push({
                     id: makeId('Z'),
                     name: name, imageUrl: imgData || '', linkUrl: link, desc: desc,
-                    geojson: tempLayer.toGeoJSON(), updatedAt: Date.now()
+                    geojson: tempLayer.toGeoJSON(),
+                    updatedAt: Date.now()
                 });
+                markLocalChange();
                 map.removeLayer(tempLayer); tempLayer = null;
             }
             saveData(); closeModal('modal-zone-info'); switchTab('zones');
@@ -591,13 +714,12 @@
     };
 
     map.on('pm:remove', (e) => {
-        if (!e.layer.zoneId) return;
-
-        markZoneDeleted(e.layer.zoneId);
-        zones = zones.filter(z => z.id !== e.layer.zoneId);
-
-        saveData();
-        renderList();
+        if(e.layer.zoneId) {
+            markZoneDeleted(e.layer.zoneId);
+            zones = zones.filter(z => z.id !== e.layer.zoneId);
+            saveData();
+            renderList();
+        }
     });
 
     function attachZoneEvents(layer, zoneData) {
@@ -612,14 +734,7 @@
             document.getElementById('zone-img-file').value = '';
             openModal('modal-zone-info');
         });
-        layer.on('pm:edit', (e) => {
-            const z = zones.find(item => item.id === zoneData.id);
-            if (z) {
-                z.geojson = e.layer.toGeoJSON();
-                touchZone(z);
-                saveData();
-            }
-        });
+        layer.on('pm:edit', (e) => { const z = zones.find(item => item.id === zoneData.id); if(z) { z.geojson = e.layer.toGeoJSON(); touchZone(z); saveData(); } });
     }
 
     /* =================================================================
@@ -633,18 +748,17 @@
         renderList();
     }
     window.clearCurrentData = function() {
-        if (!confirm('현재 탭의 모든 데이터를 삭제하시겠습니까?')) return;
-
-        if (currentTab === 'buildings') {
-            buildings.forEach(b => markBuildingDeleted(b.id));
-            buildings = [];
-        } else {
-            zones.forEach(z => markZoneDeleted(z.id));
-            zones = [];
+        if(confirm(`현재 탭의 모든 데이터를 삭제하시겠습니까?`)) {
+            if(currentTab === 'buildings') {
+                buildings.forEach(b => markBuildingDeleted(b.id));
+                buildings = [];
+            } else {
+                zones.forEach(z => markZoneDeleted(z.id));
+                zones = [];
+            }
+            saveData();
+            renderList();
         }
-
-        saveData();
-        renderList();
     }
 
     function renderList() {
@@ -717,20 +831,11 @@
         }
     }
 
-    // 페이지 로드시 서버에서 최신 데이터를 가져옴
-    loadDataFromServer();
-
-    // 다른 사용자의 변경사항을 주기적으로 반영
-    // 입력/편집 중에는 화면을 덮어쓰지 않도록 모달이 열려 있지 않을 때만 실행
-    setInterval(() => {
-        const modalOpen = document.querySelector('.modal.active');
-        const drawingMode = map.pm.globalDrawModeEnabled();
-        const editMode = map.pm.globalEditModeEnabled();
-
-        if (!modalOpen && !drawingMode && !editMode) {
-            loadDataFromServer();
-        }
-    }, 30000);
+    // 페이지 로드시 서버에서 최신 데이터를 가져오고 자동 동기화를 시작한다.
+    (async function initSync() {
+        await loadDataFromServer(true);
+        startAutoSync();
+    })();
 </script>
 </body>
 </html>

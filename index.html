@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>부동산 임장 및 구역 타겟팅 대시보드</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/@geoman-io/leaflet-geoman-free@latest/dist/leaflet-geoman.css" />
+    
+    <style>
+        body { margin: 0; padding: 0; font-family: 'Pretendard', sans-serif; overflow: hidden; }
+        
+        /* 모바일 화면 비율 (상하 65:35 - 지도 확장) */
+        #app-container { display: flex; flex-direction: column; width: 100vw; height: 100vh; overflow: hidden; background: #f3f4f6; }
+        #map { width: 100%; height: 65vh; z-index: 10; }
+        #sidebar { width: 100%; height: 35vh; background: #fff; overflow-y: auto; z-index: 20; display: flex; flex-direction: column; border-top: 1px solid #d1d5db; box-shadow: 0 -4px 6px -1px rgba(0, 0, 0, 0.1); }
+        
+        /* PC 환경일 때 좌우 비율 조정 (지도 75% : 사이드바 25%) */
+        @media (min-width: 768px) { 
+            #app-container { flex-direction: row; }
+            #map { width: 75vw; height: 100vh; }
+            #sidebar { width: 25vw; height: 100vh; border-top: none; border-left: 1px solid #d1d5db; box-shadow: -4px 0 6px -1px rgba(0, 0, 0, 0.1); }
+        }
+
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 3000; justify-content: center; align-items: center; padding: 20px; }
+        .modal.active { display: flex; }
+        
+        .floor-row { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; border-bottom: 1px solid #f3f4f6; cursor: pointer; transition: 0.2s;}
+        .floor-row:hover { background-color: #eff6ff; }
+        .floor-row.has-data { border-left: 4px solid #3b82f6; background-color: #f8fafc; }
+        .tab-btn.active { border-bottom: 2px solid #2563eb; color: #2563eb; font-weight: bold; }
+
+        .thumb-img { width: 50px; height: 50px; object-fit: cover; border-radius: 6px; border: 1px solid #e5e7eb; }
+    </style>
+</head>
+<body>
+
+<div id="app-container">
+    <!-- 지도 영역 -->
+    <div id="map"></div>
+
+    <!-- 사이드바 (부가메뉴) -->
+    <div id="sidebar" class="p-3 md:p-4">
+        <h1 class="text-lg font-bold mb-3 text-gray-800 flex justify-between items-center">
+            <span>🏢 부가메뉴</span>
+        </h1>
+        
+        <!-- 수익성 요약 위젯 (접기/펴기) -->
+        <div class="bg-blue-50 rounded-xl border border-blue-200 shadow-sm mb-3 overflow-hidden">
+            <button onclick="toggleStats()" class="w-full p-2.5 flex justify-between items-center font-bold text-gray-800 text-xs hover:bg-blue-100 transition focus:outline-none">
+                <span>📈 포트폴리오 수익률 요약 (클릭)</span>
+                <span id="stats-arrow" class="transform transition-transform duration-200 text-blue-600">▼</span>
+            </button>
+            <div id="stats-content" class="px-3 pb-3 hidden border-t border-blue-100 mt-1 pt-2 text-xs">
+                <div class="flex justify-between items-center mb-1"><span class="text-gray-600">등록 매물 수:</span><span id="total-properties" class="font-bold text-blue-700">0 건</span></div>
+                <div class="flex justify-between items-center mb-1"><span class="text-gray-600">평균 기대 수익률:</span><span id="avg-return" class="font-bold text-green-700">0.0%</span></div>
+                <div class="flex justify-between items-center mt-2 border-t border-blue-200 pt-2"><span class="text-gray-600">예상 총 평가액:</span><span id="expected-total-value" class="font-bold text-green-700">0.0 억원</span></div>
+            </div>
+        </div>
+        
+        <!-- 탭 메뉴 -->
+        <div class="flex border-b mb-2">
+            <button onclick="switchTab('buildings')" id="tab-buildings" class="tab-btn active flex-1 py-1.5 text-xs text-gray-600">타겟 건물 (마커)</button>
+            <button onclick="switchTab('zones')" id="tab-zones" class="tab-btn flex-1 py-1.5 text-xs text-gray-600">지정 구역/동선</button>
+        </div>
+
+        <div class="flex justify-between items-center mb-2 pb-1 border-b">
+            <h2 id="list-title" class="font-semibold text-xs text-gray-800">건물 및 매물 리스트</h2>
+            <button onclick="clearCurrentData()" class="text-[10px] text-red-500 hover:text-red-700 bg-red-50 px-1.5 py-0.5 rounded">초기화</button>
+        </div>
+        
+        <div id="item-list" class="flex-1 overflow-y-auto pb-4 space-y-2"></div>
+    </div>
+</div>
+
+<!-- 1. 건물 등록 모달 (파일 첨부 지원) -->
+<div id="modal-building-create" class="modal">
+    <div class="bg-white p-5 rounded-lg shadow-xl w-full max-w-sm max-h-[90vh] overflow-y-auto">
+        <h2 class="text-xl font-bold mb-4">새 건물 등록</h2>
+        <form id="form-building-create">
+            <input type="hidden" id="build-lat">
+            <input type="hidden" id="build-lng">
+            <div class="mb-3">
+                <label class="block text-sm font-medium text-gray-700 mb-1">건물명/지번 *</label>
+                <input type="text" id="build-title" required class="w-full border border-gray-300 rounded p-2">
+            </div>
+            <div class="mb-3">
+                <label class="block text-sm font-medium text-gray-700 mb-1">총 층수 (지상) *</label>
+                <input type="number" id="build-floors" required min="1" max="100" class="w-full border border-gray-300 rounded p-2">
+            </div>
+            <div class="mb-3">
+                <label class="block text-sm font-medium text-gray-700 mb-1">이미지 파일 첨부</label>
+                <input type="file" id="build-img-file" accept="image/*" class="w-full border border-gray-300 rounded p-1 text-sm bg-gray-50">
+            </div>
+            <div class="mb-5">
+                <label class="block text-sm font-medium text-gray-700 mb-1">관련 웹링크 (블로그/뉴스 등)</label>
+                <input type="url" id="build-link" placeholder="https://..." class="w-full border border-gray-300 rounded p-2 text-sm">
+            </div>
+            <div class="flex justify-end gap-2">
+                <button type="button" onclick="closeModal('modal-building-create')" class="px-4 py-2 bg-gray-200 text-gray-800 rounded font-bold">취소</button>
+                <button type="submit" class="px-4 py-2 bg-blue-600 text-white rounded font-bold">저장하기</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- 2. 건물 상세 뷰 모달 -->
+<div id="modal-building-view" class="modal">
+    <div class="bg-white p-5 rounded-lg shadow-xl w-full max-w-md max-h-[90vh] flex flex-col relative">
+        <button type="button" onclick="closeModal('modal-building-view')" class="absolute top-4 right-4 text-gray-400 hover:text-gray-800 font-bold text-xl">✕</button>
+        
+        <h2 id="view-build-title" class="text-xl font-bold text-gray-900 mb-2 pr-6">건물명</h2>
+        
+        <!-- 첨부 이미지 및 링크 영역 -->
+        <div id="view-build-media" class="mb-3 hidden flex-col gap-2">
+            <img id="view-build-img-tag" src="" alt="건물 이미지" class="w-full h-40 object-cover rounded border hidden">
+            <a id="view-build-userlink" href="#" target="_blank" class="text-sm text-blue-600 hover:underline flex items-center gap-1 hidden">
+                🔗 첨부된 관련 웹사이트 열기
+            </a>
+        </div>
+
+        <div class="flex flex-wrap gap-2 mb-3">
+            <a id="link-naver" target="_blank" class="text-xs bg-green-100 text-green-700 px-3 py-1.5 rounded font-bold border border-green-200">네이버 부동산 연동</a>
+            <a id="link-asil" target="_blank" class="text-xs bg-blue-100 text-blue-700 px-3 py-1.5 rounded font-bold border border-blue-200">아실(Asil) 연동</a>
+        </div>
+        
+        <div class="flex justify-between bg-gray-100 p-2 rounded text-xs font-bold text-gray-600 mb-1 border"><span>층수</span><span>매물 요약</span></div>
+        <div id="floor-list-container" class="flex-1 overflow-y-auto border border-gray-200 rounded mb-4 shadow-inner min-h-[150px]"></div>
+        
+        <div class="flex justify-between mt-2 pt-2 border-t">
+            <button onclick="editBuildingBasic()" class="text-sm text-gray-600 hover:underline">건물 정보(사진/링크) 수정</button>
+            <button onclick="deleteCurrentBuilding()" class="text-sm text-red-500 hover:underline">이 건물 전체 삭제</button>
+        </div>
+    </div>
+</div>
+
+<!-- 3. 층별 매물 기입 모달 -->
+<div id="modal-floor-edit" class="modal" style="z-index: 3050;">
+    <div class="bg-white p-5 rounded-lg shadow-2xl w-full max-w-sm border-t-4 border-blue-500">
+        <h2 id="floor-edit-title" class="text-lg font-bold mb-4 text-gray-800">N층 매물 정보 기입</h2>
+        <form id="form-floor-edit">
+            <div class="flex gap-2 mb-3">
+                <div class="w-1/2">
+                    <label class="block text-xs font-bold text-gray-700 mb-1">매매가(억) *</label>
+                    <input type="number" step="0.1" id="floor-price" required class="w-full border border-gray-300 rounded p-2 text-blue-600 font-bold bg-blue-50">
+                </div>
+                <div class="w-1/2">
+                    <label class="block text-xs font-bold text-gray-700 mb-1">전세가(억)</label>
+                    <input type="number" step="0.1" id="floor-jeonse" class="w-full border border-gray-300 rounded p-2 text-pink-600 font-bold bg-pink-50">
+                </div>
+            </div>
+            <div class="mb-3">
+                <label class="block text-xs font-bold text-gray-700 mb-1">기대 연수익률 (%)</label>
+                <input type="number" step="0.1" id="floor-return" class="w-full border border-gray-300 rounded p-2">
+            </div>
+            <div class="mb-4">
+                <label class="block text-xs font-bold text-gray-700 mb-1">전략 및 메모</label>
+                <textarea id="floor-comment" rows="2" class="w-full border border-gray-300 rounded p-2 text-sm"></textarea>
+            </div>
+            <div class="flex justify-between gap-2">
+                <button type="button" id="btn-delete-floor" onclick="deleteFloorData()" class="px-3 py-2 bg-red-100 text-red-700 rounded text-sm font-bold hidden">데이터 삭제</button>
+                <div class="flex gap-2 ml-auto">
+                    <button type="button" onclick="closeModal('modal-floor-edit')" class="px-3 py-2 bg-gray-200 rounded font-bold">취소</button>
+                    <button type="submit" class="px-3 py-2 bg-blue-600 text-white rounded font-bold">저장</button>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- 4. 구역/동선 정보 기입 모달 (파일 첨부 지원) -->
+<div id="modal-zone-info" class="modal">
+    <div class="bg-white p-5 rounded-lg shadow-xl w-full max-w-sm max-h-[90vh] overflow-y-auto">
+        <h2 class="text-xl font-bold mb-4">구역 및 동선 정보</h2>
+        <form id="form-zone-info">
+            <div class="mb-3">
+                <label class="block text-sm font-medium text-gray-700 mb-1">구역 이름 *</label>
+                <input type="text" id="zone-name" required placeholder="예: 재개발 예상 구역" class="w-full border border-gray-300 rounded p-2">
+            </div>
+            <div class="mb-3">
+                <label class="block text-sm font-medium text-gray-700 mb-1">이미지 파일 첨부</label>
+                <input type="file" id="zone-img-file" accept="image/*" class="w-full border border-gray-300 rounded p-1 text-sm bg-gray-50">
+            </div>
+            <div class="mb-3">
+                <label class="block text-sm font-medium text-gray-700 mb-1">관련 웹링크 (URL 주소)</label>
+                <input type="url" id="zone-link" placeholder="https://..." class="w-full border border-gray-300 rounded p-2 text-sm">
+            </div>
+            <div class="mb-5">
+                <label class="block text-sm font-medium text-gray-700 mb-1">전략 및 코멘트</label>
+                <textarea id="zone-desc" rows="3" class="w-full border border-gray-300 rounded p-2 text-sm"></textarea>
+            </div>
+            <div class="flex justify-end gap-2">
+                <button type="button" onclick="cancelZoneDrawing()" class="px-4 py-2 bg-gray-200 text-gray-800 rounded font-bold">취소/삭제</button>
+                <button type="submit" class="px-4 py-2 bg-purple-600 text-white rounded font-bold">저장</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/@geoman-io/leaflet-geoman-free@latest/dist/leaflet-geoman.min.js"></script>
+
+<script>
+    const map = L.map('map', { zoomControl: false }).setView([37.5300, 126.9800], 13);
+    L.control.zoom({ position: 'bottomright' }).addTo(map);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(map);
+
+    // 툴바 한국어 명칭 매핑
+    const customLang = {
+        buttonTitles: {
+            drawPolylineButton: '선 긋기 (거리/동선)',
+            drawPolygonButton: '다각형 (자유 구역)',
+            drawRectButton: '사각형 (정형 구역)',
+            editButton: '도형 꼭짓점 수정',
+            dragButton: '도형 전체 이동',
+            cutButton: '도형 자르기',
+            deleteButton: '지우개 (클릭 삭제)'
+        }
+    };
+    map.pm.setLang('ko-custom', customLang, 'en');
+    map.pm.setLang('ko-custom');
+
+    map.pm.addControls({ 
+        position: 'topleft', 
+        drawMarker: false, drawCircleMarker: false, drawCircle: false, drawText: false,
+        drawPolyline: true, drawRectangle: true, drawPolygon: true,
+        editMode: true, dragMode: false, cutPolygon: false, removalMode: true 
+    });
+
+    setTimeout(() => { map.invalidateSize(); }, 200);
+    window.addEventListener('resize', () => { map.invalidateSize(); });
+
+    // 데이터 저장소
+    let buildings = JSON.parse(localStorage.getItem('seoul_buildings_v5')) || [];
+    let zones = JSON.parse(localStorage.getItem('seoul_zones_v5')) || [];
+    let currentTab = 'buildings';
+    let buildingMarkers = [];
+    let zoneFeatureGroup = L.featureGroup().addTo(map);
+
+    let currentBuildingId = null;
+    let currentFloor = null;
+    let tempLayer = null;
+    let editingZoneId = null;
+    let tempImageBase64 = null;
+    let tempZoneImageBase64 = null;
+
+    function saveData() { 
+        localStorage.setItem('seoul_buildings_v5', JSON.stringify(buildings)); 
+        localStorage.setItem('seoul_zones_v5', JSON.stringify(zones));
+    }
+    function openModal(id) { document.getElementById(id).classList.add('active'); }
+    function closeModal(id) { document.getElementById(id).classList.remove('active'); }
+
+    function handleImageUpload(fileInput, callback) {
+        const file = fileInput.files[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onload = function(e) { callback(e.target.result); };
+            reader.readAsDataURL(file);
+        } else {
+            callback(null);
+        }
+    }
+
+    document.getElementById('build-img-file').addEventListener('change', function() {
+        handleImageUpload(this, (base64) => { tempImageBase64 = base64; });
+    });
+    document.getElementById('zone-img-file').addEventListener('change', function() {
+        handleImageUpload(this, (base64) => { tempZoneImageBase64 = base64; });
+    });
+
+    window.toggleStats = function() {
+        const content = document.getElementById('stats-content');
+        const arrow = document.getElementById('stats-arrow');
+        content.classList.toggle('hidden');
+        if(content.classList.contains('hidden')) arrow.style.transform = 'rotate(0deg)';
+        else arrow.style.transform = 'rotate(180deg)';
+    }
+
+    /* =================================================================
+       1. 건물 마커 및 데이터 로직
+    ================================================================= */
+    map.on('click', function(e) {
+        if(map.pm.globalDrawModeEnabled() || map.pm.globalEditModeEnabled() || map.pm.globalRemovalModeEnabled()) return;
+        document.getElementById('form-building-create').reset();
+        document.getElementById('build-lat').value = e.latlng.lat;
+        document.getElementById('build-lng').value = e.latlng.lng;
+        tempImageBase64 = null;
+        currentBuildingId = null;
+        openModal('modal-building-create');
+    });
+
+    document.getElementById('form-building-create').addEventListener('submit', function(e) {
+        e.preventDefault();
+        const title = document.getElementById('build-title').value;
+        const tFloors = parseInt(document.getElementById('build-floors').value);
+        const linkUrl = document.getElementById('build-link').value;
+
+        const processSave = (imgData) => {
+            if (currentBuildingId) {
+                const b = buildings.find(b => b.id === currentBuildingId);
+                if(b) { 
+                    b.name = title; 
+                    b.totalFloors = tFloors; 
+                    if(imgData !== null) b.imageUrl = imgData; 
+                    b.linkUrl = linkUrl; 
+                }
+            } else {
+                buildings.push({
+                    id: 'B_' + Date.now().toString(),
+                    lat: parseFloat(document.getElementById('build-lat').value),
+                    lng: parseFloat(document.getElementById('build-lng').value),
+                    name: title, totalFloors: tFloors, imageUrl: imgData || '', linkUrl: linkUrl, floors: {}
+                });
+            }
+            saveData(); closeModal('modal-building-create');
+            if(currentBuildingId) openBuildingView(currentBuildingId);
+            renderList();
+        };
+
+        const fileInput = document.getElementById('build-img-file');
+        if (fileInput.files[0]) {
+            handleImageUpload(fileInput, (base64) => { processSave(base64); });
+        } else {
+            processSave(currentBuildingId ? buildings.find(b => b.id === currentBuildingId).imageUrl : '');
+        }
+    });
+
+    window.openBuildingView = function(id) {
+        currentBuildingId = id;
+        const b = buildings.find(b => b.id === id);
+        if(!b) return;
+
+        document.getElementById('view-build-title').innerText = b.name;
+        
+        const mediaContainer = document.getElementById('view-build-media');
+        const imgTag = document.getElementById('view-build-img-tag');
+        const linkTag = document.getElementById('view-build-userlink');
+        
+        let showMedia = false;
+        if(b.imageUrl) { imgTag.src = b.imageUrl; imgTag.classList.remove('hidden'); showMedia = true; }
+        else { imgTag.classList.add('hidden'); }
+        
+        if(b.linkUrl) { linkTag.href = b.linkUrl; linkTag.classList.remove('hidden'); showMedia = true; }
+        else { linkTag.classList.add('hidden'); }
+
+        if(showMedia) mediaContainer.classList.remove('hidden');
+        else mediaContainer.classList.add('hidden');
+
+        document.getElementById('link-naver').href = `https://new.land.naver.com/complexes?ms=${b.lat},${b.lng},18&a=APT:OPST:ABYG:OBYG:GM:TJ:GSM:TGB:JW`;
+        document.getElementById('link-asil').href = `https://asil.kr/asil/index.jsp?lat=${b.lat}&lng=${b.lng}&z=17`;
+
+        const container = document.getElementById('floor-list-container');
+        container.innerHTML = '';
+        for (let i = b.totalFloors; i >= 1; i--) {
+            const f = b.floors[i];
+            const row = document.createElement('div');
+            row.className = `floor-row ${f ? 'has-data' : ''}`;
+            row.innerHTML = `<div class="font-bold text-gray-700">${i}F</div><div>${f ? `<span class="text-sm font-bold text-blue-600">${f.jeonse > 0 ? `갭 ${f.gap}억` : `매매 ${f.price}억`}</span>` : '<span class="text-xs text-gray-400">클릭하여 추가</span>'}</div>`;
+            row.onclick = () => openFloorEdit(i, f);
+            container.appendChild(row);
+        }
+        openModal('modal-building-view');
+    };
+
+    window.openFloorEdit = function(fNum, data) {
+        currentFloor = fNum; document.getElementById('floor-edit-title').innerText = `${fNum}층 매물 기입`;
+        document.getElementById('form-floor-edit').reset();
+        const delBtn = document.getElementById('btn-delete-floor');
+        if (data) {
+            document.getElementById('floor-price').value = data.price;
+            if(data.jeonse) document.getElementById('floor-jeonse').value = data.jeonse;
+            if(data.return) document.getElementById('floor-return').value = data.return;
+            if(data.comment) document.getElementById('floor-comment').value = data.comment;
+            delBtn.classList.remove('hidden');
+        } else delBtn.classList.add('hidden');
+        openModal('modal-floor-edit');
+    };
+
+    document.getElementById('form-floor-edit').addEventListener('submit', function(e) {
+        e.preventDefault();
+        const b = buildings.find(b => b.id === currentBuildingId);
+        if(!b) return;
+        const price = parseFloat(document.getElementById('floor-price').value);
+        const jeonse = parseFloat(document.getElementById('floor-jeonse').value) || 0;
+        b.floors[currentFloor] = {
+            price: price, jeonse: jeonse,
+            gap: jeonse > 0 ? parseFloat((price - jeonse).toFixed(1)) : price,
+            return: parseFloat(document.getElementById('floor-return').value) || 0,
+            comment: document.getElementById('floor-comment').value
+        };
+        saveData(); closeModal('modal-floor-edit'); openBuildingView(currentBuildingId); renderList();
+    });
+
+    window.deleteFloorData = function() {
+        if(confirm('층 데이터를 삭제할까요?')) { delete buildings.find(b => b.id === currentBuildingId).floors[currentFloor]; saveData(); closeModal('modal-floor-edit'); openBuildingView(currentBuildingId); renderList(); }
+    };
+    window.editBuildingBasic = function() {
+        const b = buildings.find(b => b.id === currentBuildingId);
+        if(!b) return;
+        document.getElementById('build-title').value = b.name;
+        document.getElementById('build-floors').value = b.totalFloors;
+        document.getElementById('build-link').value = b.linkUrl || '';
+        document.getElementById('build-img-file').value = '';
+        closeModal('modal-building-view'); openModal('modal-building-create');
+    };
+    window.deleteCurrentBuilding = function() {
+        if(confirm('건물 전체를 삭제할까요?')) { buildings = buildings.filter(b => b.id !== currentBuildingId); saveData(); closeModal('modal-building-view'); renderList(); }
+    };
+
+    /* =================================================================
+       2. 구역(선/면적) 로직
+    ================================================================= */
+    map.on('pm:create', (e) => {
+        tempLayer = e.layer; editingZoneId = null;
+        document.getElementById('form-zone-info').reset(); 
+        tempZoneImageBase64 = null;
+        openModal('modal-zone-info');
+    });
+
+    document.getElementById('form-zone-info').addEventListener('submit', function(e) {
+        e.preventDefault();
+        const name = document.getElementById('zone-name').value;
+        const link = document.getElementById('zone-link').value;
+        const desc = document.getElementById('zone-desc').value;
+
+        const processZoneSave = (imgData) => {
+            if(editingZoneId) {
+                const z = zones.find(z => z.id === editingZoneId);
+                if(z) { 
+                    z.name = name; 
+                    if(imgData !== null) z.imageUrl = imgData; 
+                    z.linkUrl = link; 
+                    z.desc = desc; 
+                }
+            } else if (tempLayer) {
+                zones.push({
+                    id: 'Z_' + Date.now().toString(),
+                    name: name, imageUrl: imgData || '', linkUrl: link, desc: desc,
+                    geojson: tempLayer.toGeoJSON()
+                });
+                map.removeLayer(tempLayer); tempLayer = null;
+            }
+            saveData(); closeModal('modal-zone-info'); switchTab('zones');
+        };
+
+        const fileInput = document.getElementById('zone-img-file');
+        if (fileInput.files[0]) {
+            handleImageUpload(fileInput, (base64) => { processZoneSave(base64); });
+        } else {
+            const existingZ = zones.find(z => z.id === editingZoneId);
+            processZoneSave(existingZ ? existingZ.imageUrl : '');
+        }
+    });
+
+    window.cancelZoneDrawing = function() {
+        if(tempLayer && !editingZoneId) map.removeLayer(tempLayer);
+        tempLayer = null; editingZoneId = null; closeModal('modal-zone-info');
+    };
+
+    map.on('pm:remove', (e) => { if(e.layer.zoneId) { zones = zones.filter(z => z.id !== e.layer.zoneId); saveData(); renderList(); } });
+
+    function attachZoneEvents(layer, zoneData) {
+        layer.zoneId = zoneData.id;
+        layer.bindTooltip(`<b>${zoneData.name}</b>`, { sticky: true });
+        layer.on('click', () => {
+            if(map.pm.globalEditModeEnabled() || map.pm.globalRemovalModeEnabled()) return;
+            editingZoneId = zoneData.id;
+            document.getElementById('zone-name').value = zoneData.name;
+            document.getElementById('zone-link').value = zoneData.linkUrl || '';
+            document.getElementById('zone-desc').value = zoneData.desc;
+            document.getElementById('zone-img-file').value = '';
+            openModal('modal-zone-info');
+        });
+        layer.on('pm:edit', (e) => { const z = zones.find(item => item.id === zoneData.id); if(z) { z.geojson = e.layer.toGeoJSON(); saveData(); } });
+    }
+
+    /* =================================================================
+       3. 렌더링 및 통계
+    ================================================================= */
+    window.switchTab = function(tab) {
+        currentTab = tab;
+        document.getElementById('tab-buildings').classList.toggle('active', tab === 'buildings');
+        document.getElementById('tab-zones').classList.toggle('active', tab === 'zones');
+        document.getElementById('list-title').innerText = tab === 'buildings' ? '타겟 건물 리스트' : '지정 구역 리스트';
+        renderList();
+    }
+    window.clearCurrentData = function() {
+        if(confirm(`현재 탭의 모든 데이터를 삭제하시겠습니까?`)) { if(currentTab === 'buildings') buildings = []; else zones = []; saveData(); renderList(); }
+    }
+
+    function renderList() {
+        buildingMarkers.forEach(m => map.removeLayer(m)); buildingMarkers = [];
+        zoneFeatureGroup.clearLayers();
+        const listEl = document.getElementById('item-list');
+        listEl.innerHTML = '';
+
+        let totalProps = 0, sumReturn = 0, totalValue = 0;
+
+        if (currentTab === 'buildings') {
+            if(buildings.length === 0) listEl.innerHTML = '<p class="text-gray-400 text-xs text-center mt-6">지도를 클릭하여 건물을 세워보세요.</p>';
+            
+            buildings.forEach(b => {
+                const floorKeys = Object.keys(b.floors);
+                totalProps += floorKeys.length;
+                floorKeys.forEach(k => { const f = b.floors[k]; sumReturn += (f.return||0); totalValue += f.price * (1 + ((f.return||0) / 100)); });
+
+                const marker = L.marker([b.lat, b.lng]).addTo(map);
+                marker.on('click', () => openBuildingView(b.id)); marker.bindTooltip(b.name); buildingMarkers.push(marker);
+
+                const card = document.createElement('div');
+                card.className = 'border border-gray-200 bg-white rounded p-2 flex gap-2.5 hover:border-blue-400 hover:shadow-sm cursor-pointer transition';
+                
+                let imgHtml = '';
+                if(b.imageUrl) imgHtml = `<img src="${b.imageUrl}" class="thumb-img" alt="썸네일">`;
+                
+                card.innerHTML = `
+                    ${imgHtml}
+                    <div class="flex-1 min-w-0">
+                        <div class="flex justify-between items-center mb-0.5">
+                            <b class="text-gray-800 text-xs truncate">${b.name}</b>
+                            <span class="text-[10px] bg-gray-100 px-1.5 py-0.2 rounded">${b.totalFloors}층</span>
+                        </div>
+                        <div class="text-[11px] text-gray-500">기입된 매물: <b class="text-blue-600">${floorKeys.length}건</b></div>
+                        ${b.linkUrl ? '<div class="text-[10px] text-blue-500 mt-0.5">🔗 링크 포함</div>' : ''}
+                    </div>
+                `;
+                card.onclick = () => { map.setView([b.lat, b.lng], 16); openBuildingView(b.id); };
+                listEl.appendChild(card);
+            });
+            
+            document.getElementById('total-properties').innerText = `${totalProps} 건`;
+            document.getElementById('avg-return').innerText = totalProps > 0 ? (sumReturn / totalProps).toFixed(1) + '%' : '0.0%';
+            document.getElementById('expected-total-value').innerText = totalProps > 0 ? totalValue.toFixed(1) + ' 억원' : '0.0 억원';
+            
+        } else {
+            document.getElementById('total-properties').innerText = '-'; document.getElementById('avg-return').innerText = '-'; document.getElementById('expected-total-value').innerText = '-';
+            
+            if(zones.length === 0) listEl.innerHTML = '<p class="text-gray-400 text-xs text-center mt-6">좌측 메뉴 툴로 지도에 구역을 그려보세요.</p>';
+            zones.forEach(z => {
+                const layerGroup = L.geoJSON(z.geojson, { style: { color: '#9333ea', weight: 3, fillColor: '#9333ea', fillOpacity: 0.3 } });
+                const layer = layerGroup.getLayers()[0]; attachZoneEvents(layer, z); zoneFeatureGroup.addLayer(layer);
+
+                const card = document.createElement('div');
+                card.className = 'border-l-4 border-purple-500 bg-gray-50 rounded p-2 flex gap-2.5 cursor-pointer hover:shadow-sm transition';
+                let imgHtml = z.imageUrl ? `<img src="${z.imageUrl}" class="thumb-img" alt="썸네일">` : '';
+                
+                card.innerHTML = `
+                    ${imgHtml}
+                    <div class="flex-1 overflow-hidden min-w-0">
+                        <b class="text-gray-800 text-xs block truncate">${z.name}</b>
+                        <div class="text-[11px] mt-0.5 text-gray-600 truncate">${z.desc || '설명 없음'}</div>
+                        ${z.linkUrl ? '<a href="'+z.linkUrl+'" target="_blank" class="text-[10px] text-blue-500 mt-0.5 block hover:underline" onclick="event.stopPropagation()">🔗 링크 열기</a>' : ''}
+                    </div>
+                `;
+                card.onclick = () => { if(layer.getBounds) map.fitBounds(layer.getBounds()); else if(layer.getLatLng) map.setView(layer.getLatLng(), 16); };
+                listEl.appendChild(card);
+            });
+        }
+    }
+
+    renderList();
+</script>
+</body>
+</html>

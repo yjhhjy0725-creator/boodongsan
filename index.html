@@ -44,6 +44,7 @@
     <div id="sidebar" class="p-3 md:p-4">
         <h1 class="text-lg font-bold mb-3 text-gray-800 flex justify-between items-center">
             <span>🏢 부가메뉴</span>
+            <button onclick="loadDataFromServer()" class="text-xs bg-blue-50 text-blue-600 px-2 py-1 rounded hover:bg-blue-100">🔄 새로고침</button>
         </h1>
         
         <!-- 수익성 요약 위젯 (접기/펴기) -->
@@ -202,6 +203,9 @@
 <script src="https://unpkg.com/@geoman-io/leaflet-geoman-free@latest/dist/leaflet-geoman.min.js"></script>
 
 <script>
+    // 🔗 구글 시트 웹 앱 URL 설정 (이 주소를 통해 서버와 데이터를 동기화합니다)
+    const WEB_APP_URL = "https://script.google.com/macros/s/AKfycbwzyZygJut9Ykc_pZfd4sr7thZt74aMaXHjLttIRH7H6QbaWVaDEFS1JThTbBgFA1I9/exec";
+
     const map = L.map('map', { zoomControl: false }).setView([37.5300, 126.9800], 13);
     L.control.zoom({ position: 'bottomright' }).addTo(map);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(map);
@@ -231,9 +235,9 @@
     setTimeout(() => { map.invalidateSize(); }, 200);
     window.addEventListener('resize', () => { map.invalidateSize(); });
 
-    // 데이터 저장소
-    let buildings = JSON.parse(localStorage.getItem('seoul_buildings_v5')) || [];
-    let zones = JSON.parse(localStorage.getItem('seoul_zones_v5')) || [];
+    // 데이터 저장소 (서버 동기화 반영)
+    let buildings = [];
+    let zones = [];
     let currentTab = 'buildings';
     let buildingMarkers = [];
     let zoneFeatureGroup = L.featureGroup().addTo(map);
@@ -245,10 +249,41 @@
     let tempImageBase64 = null;
     let tempZoneImageBase64 = null;
 
-    function saveData() { 
+    // 서버(구글 시트) 데이터 불러오기 함수
+    async function loadDataFromServer() {
+        if (!WEB_APP_URL) return;
+        try {
+            const response = await fetch(`${WEB_APP_URL}?action=getData`);
+            const result = await response.json();
+            if (result.status === "success") {
+                if (result.buildings) buildings = result.buildings;
+                if (result.zones) zones = result.zones;
+                renderList();
+            }
+        } catch (error) {
+            console.error("데이터 동기화 실패 (로컬 데이터 유지):", error);
+        }
+    }
+
+    // 서버로 데이터 저장 함수
+    async function saveData() {
+        // 로컬에 백업 저장
         localStorage.setItem('seoul_buildings_v5', JSON.stringify(buildings)); 
         localStorage.setItem('seoul_zones_v5', JSON.stringify(zones));
+
+        if (!WEB_APP_URL) return;
+        try {
+            await fetch(WEB_APP_URL, {
+                method: 'POST',
+                mode: 'no-cors',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action: 'saveData', buildings: buildings, zones: zones })
+            });
+        } catch (error) {
+            console.error("서버 전송 중 오류 발생:", error);
+        }
     }
+
     function openModal(id) { document.getElementById(id).classList.add('active'); }
     function closeModal(id) { document.getElementById(id).classList.remove('active'); }
 
@@ -280,7 +315,7 @@
 
     /* =================================================================
        1. 건물 마커 및 데이터 로직
-    ================================================================= */
+    ================================================================ */
     map.on('click', function(e) {
         if(map.pm.globalDrawModeEnabled() || map.pm.globalEditModeEnabled() || map.pm.globalRemovalModeEnabled()) return;
         document.getElementById('form-building-create').reset();
@@ -411,7 +446,7 @@
 
     /* =================================================================
        2. 구역(선/면적) 로직
-    ================================================================= */
+    ================================================================ */
     map.on('pm:create', (e) => {
         tempLayer = e.layer; editingZoneId = null;
         document.getElementById('form-zone-info').reset(); 
@@ -478,7 +513,7 @@
 
     /* =================================================================
        3. 렌더링 및 통계
-    ================================================================= */
+    ================================================================ */
     window.switchTab = function(tab) {
         currentTab = tab;
         document.getElementById('tab-buildings').classList.toggle('active', tab === 'buildings');
@@ -502,7 +537,7 @@
             if(buildings.length === 0) listEl.innerHTML = '<p class="text-gray-400 text-xs text-center mt-6">지도를 클릭하여 건물을 세워보세요.</p>';
             
             buildings.forEach(b => {
-                const floorKeys = Object.keys(b.floors);
+                const floorKeys = Object.keys(b.floors || {});
                 totalProps += floorKeys.length;
                 floorKeys.forEach(k => { const f = b.floors[k]; sumReturn += (f.return||0); totalValue += f.price * (1 + ((f.return||0) / 100)); });
 
@@ -560,7 +595,8 @@
         }
     }
 
-    renderList();
+    // 페이지 로드시 서버에서 최신 데이터를 가져옴
+    loadDataFromServer();
 </script>
 </body>
 </html>

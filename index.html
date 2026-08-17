@@ -213,6 +213,16 @@
 <script src="https://unpkg.com/@geoman-io/leaflet-geoman-free@latest/dist/leaflet-geoman.min.js"></script>
 
 <script>
+    // 👇 3번 방법: 여기에 비밀번호 코드를 먼저 넣습니다! 👇
+    const userPassword = prompt("웹사이트에 접속하려면 비밀번호를 입력하세요:");
+    const correctPassword = "2580"; // 💡 "1234" 대신 원하시는 비밀번호로 숫자를 바꿔주세요!
+
+    if (userPassword !== correctPassword) {
+        alert("비밀번호가 틀렸습니다. 사이트를 이용할 수 없습니다.");
+        document.body.innerHTML = "<h2 style='text-align:center; margin-top:50px;'>접근 권한이 없습니다 🚫</h2>";
+        throw new Error("접근 차단됨"); 
+    }
+    // 👆 여기까지 👆
     // 🔗 Google Apps Script Web App URL
     const WEB_APP_URL = "https://script.google.com/macros/s/AKfycbzeaBC-J5YfNjfcfnlBvMwejCHFCJeL0Vr-5DCCtjEKsIYB6VRTt2dGtQekmcHSwr_W/exec";
 

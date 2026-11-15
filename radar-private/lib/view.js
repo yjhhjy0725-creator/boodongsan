@@ -18,6 +18,7 @@ function dashboard() {
   let displayedProjects = [];
   let selection;
   let saved = new Set();
+  const compared = new Set();
   try { saved = new Set(JSON.parse(localStorage.getItem('radar-saved-listings') || '[]')); } catch {}
   let projectRevision;
   let syncing = false;
@@ -55,6 +56,122 @@ function dashboard() {
     anchor.rel = 'noopener noreferrer';
     return anchor;
   }
+  function naverNearby(row) {
+    if (!row.location) return null;
+    const [lat, lng] = row.location.point;
+    return 'https://new.land.naver.com/complexes?ms=' +
+      lat + ',' + lng + ',18&a=APT:OPST:ABYG:OBYG:GM:TJ:GSM:TGB:JW';
+  }
+  const asil = 'https://asil.kr/asil/index.jsp';
+  function inspection(row) {
+    const verification = row.verification;
+    const spatial = {
+      구역내_공간대조: '공간 대조 · 구역 내',
+      구역외_공간대조: '공간 대조 · 구역 외',
+      경계_검증필요: '경계 추가 검증',
+    };
+    return [
+      ['공식 주소', verification.address ? '확인' : '대기', verification.addressSource,
+        verification.address ? [verification.address, verification.addressDate].join(' · ') : ''],
+      ['실건물 위치', row.pin ? '확인' : '대기'],
+      ['필지 식별', verification.pnu ? '확인' : '대기'],
+      ['정비구역 대조', spatial[verification.spatialStatus] || '미확인', verification.boundarySource, verification.boundaryDate],
+    ];
+  }
+  function evidence(row) {
+    const section = textNode('div', '', 'evidence');
+    section.append(textNode('h4', '검증 근거'));
+    const list = document.createElement('dl');
+    for (const [label, state, url, note] of inspection(row)) {
+      const value = document.createElement('dd');
+      value.append(textNode('span', state, state === '확인' ? 'statusGood' : 'statusPending'));
+      if (note) value.append(textNode('small', note));
+      if (url) value.append(external('공식 출처', url));
+      list.append(textNode('dt', label), value);
+    }
+    section.append(list);
+    if (row.verification.lastUpdated) section.append(textNode('small', '검증 원장 갱신 ' + row.verification.lastUpdated, 'meta'));
+    if (row.verification.spatialStatus !== '미확인') {
+      section.append(textNode('small', '공간 대조 결과입니다. 법정 편입은 지정·변경 고시와 필지로 확인합니다.', 'meta'));
+    }
+    return section;
+  }
+  function openFromWorkbench(row) {
+    byId('group').hidden = true;
+    showDetail(row, 'ad');
+    byId('detail').scrollIntoView({ block: 'center' });
+  }
+  function comparisonButton(row) {
+    const button = action(compared.has(row.id) ? '비교에서 빼기' : '비교에 추가', () => {
+      if (compared.has(row.id)) compared.delete(row.id);
+      else if (compared.size < 4) compared.add(row.id);
+      renderWorkbench();
+      if (selection?.kind === 'ad' && selection.id === row.id) showDetail(row, 'ad');
+    });
+    button.disabled = compared.size >= 4 && !compared.has(row.id);
+    return button;
+  }
+  function renderWorkbench() {
+    const favorites = [...saved].map(id => state.get(id)).filter(Boolean);
+    const picked = [...compared].map(id => state.get(id)).filter(Boolean);
+    byId('savedCount').textContent = '관심 ' + favorites.length + '건 · 비교 ' + picked.length + '/4건';
+    const cards = document.createDocumentFragment();
+    for (const row of favorites) {
+      const card = textNode('article', '', 'watchCard');
+      card.append(action(row.name, () => openFromWorkbench(row), 'rowLink'),
+        textNode('p', [row.district, row.price === null ? '호가 미확인' : row.price + '억',
+          row.verification.address ? '공식 주소 확인' : '주소 대기', row.pin ? '실건물 확인' : '실건물 대기'].join(' · '), 'meta'),
+        comparisonButton(row));
+      cards.append(card);
+    }
+    if (!favorites.length) cards.append(textNode('p', '매물 상세에서 관심 매물을 저장하면 여기에 표시됩니다.', 'meta'));
+    byId('watchCards').replaceChildren(cards);
+    const wrap = byId('comparison');
+    wrap.replaceChildren();
+    if (!picked.length) return;
+    if (picked.length === 1) wrap.append(textNode('p', '후보를 하나 더 추가하면 나란히 비교할 수 있습니다.', 'meta'));
+    const table = document.createElement('table');
+    const header = document.createElement('thead');
+    const headings = document.createElement('tr');
+    headings.append(textNode('th', '항목'));
+    for (const row of picked) {
+      const th = document.createElement('th');
+      th.append(action(row.name, () => openFromWorkbench(row), 'rowLink'), comparisonButton(row));
+      headings.append(th);
+    }
+    header.append(headings);
+    const body = document.createElement('tbody');
+    const metrics = [
+      ['자치구', row => row.district], ['호가', row => row.price === null ? '—' : row.price + '억'],
+      ['전용면적', row => row.area === null ? '—' : row.area + '㎡'],
+      ['투자 적합도', row => row.score ?? '—'], ['근거 신뢰도', row => row.confidence ?? '—'],
+      ['공식 주소', row => inspection(row)[0][1]], ['실건물 위치', row => inspection(row)[1][1]],
+      ['필지 식별', row => inspection(row)[2][1]], ['정비구역 대조', row => inspection(row)[3][1]],
+    ];
+    for (const [label, value] of metrics) {
+      const tr = document.createElement('tr');
+      const name = textNode('th', label);
+      name.scope = 'row';
+      tr.append(name);
+      for (const row of picked) tr.append(textNode('td', value(row)));
+      body.append(tr);
+    }
+    const linkRow = document.createElement('tr');
+    const linkHeading = textNode('th', '근거·비교 자료');
+    linkHeading.scope = 'row';
+    linkRow.append(linkHeading);
+    for (const row of picked) {
+      const cell = textNode('td', '', 'compareLinks');
+      for (const [label, url] of [['광고 원문', row.adUrl], ['네이버 주변 매물', naverNearby(row)],
+        ['아실 실거래가', asil], ['공식 경계 근거', row.verification.boundarySource]]) {
+        if (url) cell.append(external(label, url));
+      }
+      linkRow.append(cell);
+    }
+    body.append(linkRow);
+    table.append(header, body);
+    wrap.append(table);
+  }
   function showDetail(row, kind) {
     selection = { id: row.id, kind };
     const box = byId('detail');
@@ -82,8 +199,10 @@ function dashboard() {
         try { localStorage.setItem('radar-saved-listings', JSON.stringify([...saved])); } catch {}
         renderRows();
         refreshMap();
+        renderWorkbench();
         showDetail(row, kind);
       }));
+      links.append(comparisonButton(row));
     }
     if (row.location) links.append(action('지도에서 보기', () => {
       if (!byId(kind === 'ad' ? 'showAds' : 'showProjects').checked) byId(kind === 'ad' ? 'showAds' : 'showProjects').checked = true;
@@ -93,13 +212,11 @@ function dashboard() {
       byId('mapPanel').scrollIntoView({ block: 'nearest' });
     }));
     box.append(links);
+    if (kind === 'ad') box.append(evidence(row));
     const mapLinks = textNode('div', '', 'links');
-    if (row.location) {
-      const [lat, lng] = row.location.point;
-      mapLinks.append(external('네이버부동산 주변 매물', 'https://new.land.naver.com/complexes?ms=' +
-        lat + ',' + lng + ',18&a=APT:OPST:ABYG:OBYG:GM:TJ:GSM:TGB:JW'));
-    }
-    mapLinks.append(external('아실 실거래가 열기', 'https://asil.kr/asil/index.jsp'));
+    const nearby = naverNearby(row);
+    if (nearby) mapLinks.append(external('네이버부동산 주변 매물', nearby));
+    mapLinks.append(external('아실 실거래가 열기', asil));
     const searchField = document.createElement('input');
     searchField.type = 'text';
     searchField.readOnly = true;
@@ -276,7 +393,10 @@ function dashboard() {
       const { changed, removed, counts, fetchedAt } = payload;
       if (payload.projects) projects = payload.projects;
       projectRevision = payload.projectRevision;
-      for (const id of removed) state.delete(id);
+      for (const id of removed) {
+        state.delete(id);
+        compared.delete(id);
+      }
       for (const ad of changed) state.set(ad.id, ad);
       byId('status').textContent = '원문 ' + counts.raw + '행 · 고유 ' + counts.unique + '건 · 중복 ' +
         counts.duplicates + '행 · ' + new Date(fetchedAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' }) + ' 원장 조회';
@@ -284,6 +404,7 @@ function dashboard() {
       if (changedMap) {
         renderRows();
         renderProjects();
+        renderWorkbench();
         byId('group').hidden = true;
         if (firstLoad) fitMap();
         else refreshMap();
@@ -386,6 +507,19 @@ canvas{display:block;width:100%;height:auto;border-radius:10px}a{color:#135340}
 .detail h3,.group h3{margin:0;font-size:16px}.detail .links{margin-bottom:0}
 .group{max-height:168px;overflow:auto}.group button{display:block}
 .precision{color:#805218;font-weight:600}
+.evidence{border-top:1px solid #ceded5;margin-top:12px;padding-top:10px}
+.evidence h4{margin:0;font-size:14px}
+.evidence dl{display:grid;grid-template-columns:100px 1fr;gap:7px 10px;margin:8px 0;font-size:13px}
+.evidence dt{color:#4e685c}.evidence dd{margin:0;display:flex;align-items:baseline;gap:6px;flex-wrap:wrap}
+.statusGood,.statusPending{padding:1px 7px;border-radius:5px;font-weight:700}
+.statusGood{background:#d8ede0;color:#12543c}.statusPending{background:#f3e9d4;color:#714813}
+.watchCards{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,235px),1fr));gap:10px}
+.watchCard{background:#f1f6f3;border:1px solid #d8e4dc;border-radius:10px;padding:10px}
+.watchCard .rowLink{font-weight:700}.compare{overflow:auto;margin-top:14px}
+.compare th,.compare td{min-width:155px}.compare th:first-child{min-width:108px;position:sticky;left:0}
+.compare th .secondary{display:block;margin-top:4px;padding:3px 6px;font-size:12px}
+.compareLinks a{display:block;margin-bottom:3px}
+.jump{display:inline-block;padding:7px 10px;border:1px solid #abc4b7;border-radius:8px}
 iframe{display:block;width:100%;height:540px;border:1px solid #d8e4dc;border-radius:10px;margin-top:12px}
 .links{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:12px 0}
 .project-filter{max-width:420px}
@@ -405,6 +539,7 @@ export function render(nonce, mode, message = '') {
     <label>최대 관찰호가 (억)<input id="budget" type="number" min="0" step="0.1"></label>
     <label class="check"><input id="savedOnly" type="checkbox"> 관심 매물만</label>
     <button id="refresh" type="button">원장 새로고침</button>
+    <a class="jump" href="#watchlist">내 매물·비교</a>
   </div><p class="meta" id="status" role="status"></p><small>이 화면이 열려 있는 동안 2분마다 원장을 확인합니다.</small></section>
   <div class="grid">
     <section id="mapPanel"><h2>서울 매물·정비사업 지도</h2>
@@ -426,6 +561,12 @@ export function render(nonce, mode, message = '') {
       <div class="scroll"><table><thead><tr><th>단지</th><th>자치구</th><th>호가(억)</th><th>전용㎡</th><th>적합도</th><th>신뢰도</th></tr></thead><tbody id="rows"></tbody></table></div>
     </section>
   </div>
+  <section id="watchlist" aria-labelledby="watchHeading">
+    <h2 id="watchHeading">내 매물·비교</h2>
+    <p id="savedCount" class="meta" role="status"></p>
+    <div id="watchCards" class="watchCards"></div>
+    <div id="comparison" class="compare" aria-label="후보 비교"></div>
+  </section>
   <section aria-labelledby="projectHeading">
     <h2 id="projectHeading">정비사업 경계 조회</h2>
     <p class="meta">서울플랜+ 지도에서 사업명을 검색한 뒤 지정·변경 고시를 확인하세요. 원장 목록과 공식 지도는 자동으로 대조되지 않습니다.</p>

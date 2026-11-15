@@ -8,6 +8,7 @@ const ranges = [
   "'지도위치_좌표관리'!A1:P",
   "'정비사업_지도레이어'!A1:N",
   "'매물_링크_허브'!A1:I",
+  "'BUILDING_VERIFICATION_v1'!A1:Q",
 ];
 const hash = (value) => createHash('sha256').update(JSON.stringify(value)).digest('base64url');
 let token;
@@ -53,6 +54,12 @@ function rows(values, required) {
 const number = (value) => typeof value === 'number' && Number.isFinite(value) ? value : null;
 const yes = (value) => value === true || ['true', 'yes', 'y'].includes(String(value).trim().toLowerCase());
 
+function metric(value) {
+  if (typeof value !== 'string') return number(value);
+  const text = value.trim();
+  return /^\d+(?:\.\d+)?$/.test(text) ? number(Number(text)) : null;
+}
+
 function coordinates(lat, lng) {
   return number(lat) !== null && number(lng) !== null && lat >= 37.4 && lat <= 37.75 &&
     lng >= 126.7 && lng <= 127.25 ? [lat, lng] : null;
@@ -81,7 +88,7 @@ const notionHost = (host) => ['app.notion.com', 'www.notion.so', 'notion.so'].in
 const officialHost = (host) => /\.(go\.kr|seoul\.kr)$/.test(host);
 const byKey = (entries, field) => new Map(entries.filter(row => row[field]).map(row => [String(row[field]).trim(), row]));
 
-export function projectLedger([raw, ranking, locations, zoneLedger, adMap, projectMap, linkLedger]) {
+export function projectLedger([raw, ranking, locations, zoneLedger, adMap, projectMap, linkLedger, verificationLedger]) {
   const ads = rows(raw.values, ['외부매물키', '서울자치구', '단지', '매도호가_억', '전용면적_㎡']);
   const scores = new Map(rows(ranking.values, ['매물고유키', '투자 적합도 100', '근거 신뢰도 100'])
     .map((row) => [String(row['매물고유키'] ?? '').trim(), row]));
@@ -89,6 +96,16 @@ export function projectLedger([raw, ranking, locations, zoneLedger, adMap, proje
   const estimates = byKey(rows(adMap.values, ['외부매물키', '좌표 정밀도', '위도', '경도']), '외부매물키');
   const projectPoints = byKey(rows(projectMap.values, ['정비사업키', '위치정밀도', '위도', '경도']), '정비사업키');
   const adLinks = byKey(rows(linkLedger.values, ['외부매물키', '원본광고(해당 매물 직접)']), '외부매물키');
+  const verificationByKey = new Map();
+  const verificationFields = ['external_key', 'building_official_source_url', 'official_address_verified_at',
+    'building_pnu', 'verification_status', 'zone_inclusion_status', 'last_updated_at'];
+  for (const row of rows(verificationLedger.values, verificationFields)) {
+    const id = String(row.external_key ?? '').trim();
+    if (!id) continue;
+    const previous = verificationByKey.get(id);
+    const date = String(row.last_updated_at ?? '');
+    if (!previous || date >= String(previous.last_updated_at ?? '')) verificationByKey.set(id, row);
+  }
   const locationFields = ['external_key', 'export_eligible', 'building_address_verified', 'coordinate_precision', 'lat', 'lng'];
   for (const row of rows(locations.values, locationFields)) {
     const point = coordinates(row.lat, row.lng);
@@ -109,10 +126,18 @@ export function projectLedger([raw, ranking, locations, zoneLedger, adMap, proje
     const mapRow = estimates.get(id);
     const links = adLinks.get(id);
     const pin = pins.get(id) ?? null;
+    const review = verificationByKey.get(id);
+    const addressSource = link(review?.building_official_source_url, officialHost);
+    const boundarySource = link(review?.official_boundary_source_url, officialHost);
+    const verifiedAddress = addressSource && review?.official_address_verified_at && review?.building_address;
+    const pnu = addressSource && /^\d{19}$/.test(String(review?.building_pnu ?? ''));
+    const spatialStatus = boundarySource && review?.boundary_version_date &&
+      ['구역내_공간대조', '구역외_공간대조', '경계_검증필요'].includes(review?.zone_inclusion_status)
+      ? review.zone_inclusion_status : '미확인';
     const listing = {
       id, district: row['서울자치구'] ?? '', name: row['단지'] || '단지명 미확인',
-      price: number(row['매도호가_억']), area: number(row['전용면적_㎡']),
-      score: number(score?.['투자 적합도 100']), confidence: number(score?.['근거 신뢰도 100']),
+      price: metric(row['매도호가_억']), area: metric(row['전용면적_㎡']),
+      score: metric(score?.['투자 적합도 100']), confidence: metric(score?.['근거 신뢰도 100']),
       pin, location: pin ? { point: pin, precision: '검증 건물', area: '' } :
         estimate(mapRow, '좌표 정밀도', '지도표시주소(매물주소 아님)'),
       neighborhood: mapRow?.['기준법정동'] || '',
@@ -122,6 +147,17 @@ export function projectLedger([raw, ranking, locations, zoneLedger, adMap, proje
       notionUrl: link(row['노션 상세'], notionHost) ?? link(mapRow?.['노션 상세URL'], notionHost),
       naverUrl: link(links?.['네이버 동일매물 직접링크(검증시)'], host => /(^|\.)land\.naver\.com$/.test(host)),
       searchUrl: link(links?.['네이버 개별매물 검색(미확인)'], host => host === 'search.naver.com'),
+      verification: {
+        address: verifiedAddress || null,
+        addressDate: verifiedAddress ? review.official_address_verified_at : '',
+        addressSource,
+        pnu: Boolean(pnu),
+        spatialStatus,
+        boundarySource,
+        boundaryDate: boundarySource ? review.boundary_version_date || '' : '',
+        status: ['미검증', '검증완료', '보류', '오류'].includes(review?.verification_status) ? review.verification_status : '미검증',
+        lastUpdated: review?.last_updated_at || '',
+      },
     };
     unique.set(id, { ...listing, revision: hash(listing) });
   }

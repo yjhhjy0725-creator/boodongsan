@@ -5,6 +5,9 @@ const ranges = [
   "'RADAR_v2_투자적합순위'!A1:AA",
   "'MAP_EXPORT_v1'!A1:V",
   "'RADAR_구역폴리곤상태'!A1:I",
+  "'지도위치_좌표관리'!A1:P",
+  "'정비사업_지도레이어'!A1:N",
+  "'매물_링크_허브'!A1:I",
 ];
 const hash = (value) => createHash('sha256').update(JSON.stringify(value)).digest('base64url');
 let token;
@@ -50,19 +53,49 @@ function rows(values, required) {
 const number = (value) => typeof value === 'number' && Number.isFinite(value) ? value : null;
 const yes = (value) => value === true || ['true', 'yes', 'y'].includes(String(value).trim().toLowerCase());
 
-export function projectLedger([raw, ranking, locations, zoneLedger]) {
+function coordinates(lat, lng) {
+  return number(lat) !== null && number(lng) !== null && lat >= 37.4 && lat <= 37.75 &&
+    lng >= 126.7 && lng <= 127.25 ? [lat, lng] : null;
+}
+
+function estimate(row, precisionField, addressField) {
+  const precision = row?.[precisionField];
+  const point = coordinates(row?.['위도'], row?.['경도']);
+  return point && ['동 중심 추정', '구 중심 추정'].includes(precision)
+    ? { point, precision, area: row[addressField] || '' }
+    : null;
+}
+
+function link(value, allowed) {
+  if (typeof value !== 'string' || !value) return null;
+  try {
+    const url = new URL(value.trim());
+    return url.protocol === 'https:' && !url.username && !url.password && allowed(url.hostname) ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+const adHost = (host) => /(^|\.)(daangn\.com|naver\.com|zigbang\.com|dabangapp\.com|hogangnono\.com|kbland\.kr)$/.test(host);
+const notionHost = (host) => ['app.notion.com', 'www.notion.so', 'notion.so'].includes(host);
+const officialHost = (host) => /\.(go\.kr|seoul\.kr)$/.test(host);
+const byKey = (entries, field) => new Map(entries.filter(row => row[field]).map(row => [String(row[field]).trim(), row]));
+
+export function projectLedger([raw, ranking, locations, zoneLedger, adMap, projectMap, linkLedger]) {
   const ads = rows(raw.values, ['외부매물키', '서울자치구', '단지', '매도호가_억', '전용면적_㎡']);
   const scores = new Map(rows(ranking.values, ['매물고유키', '투자 적합도 100', '근거 신뢰도 100'])
     .map((row) => [String(row['매물고유키'] ?? '').trim(), row]));
   const pins = new Map();
+  const estimates = byKey(rows(adMap.values, ['외부매물키', '좌표 정밀도', '위도', '경도']), '외부매물키');
+  const projectPoints = byKey(rows(projectMap.values, ['정비사업키', '위치정밀도', '위도', '경도']), '정비사업키');
+  const adLinks = byKey(rows(linkLedger.values, ['외부매물키', '원본광고(해당 매물 직접)']), '외부매물키');
   const locationFields = ['external_key', 'export_eligible', 'building_address_verified', 'coordinate_precision', 'lat', 'lng'];
   for (const row of rows(locations.values, locationFields)) {
-    const lat = number(row.lat);
-    const lng = number(row.lng);
+    const point = coordinates(row.lat, row.lng);
     if (yes(row.export_eligible) && yes(row.building_address_verified) &&
       ['building_verified', 'verified_building', '실건물확정', '실건물좌표 확인'].includes(String(row.coordinate_precision).trim().toLowerCase()) &&
-      lat >= 37.4 && lat <= 37.75 && lng >= 126.7 && lng <= 127.25) {
-      pins.set(String(row.external_key ?? '').trim(), [lat, lng]);
+      point) {
+      pins.set(String(row.external_key ?? '').trim(), point);
     }
   }
   const unique = new Map();
@@ -73,11 +106,21 @@ export function projectLedger([raw, ranking, locations, zoneLedger]) {
     rawCount += 1;
     if (unique.has(id)) continue;
     const score = scores.get(id);
+    const mapRow = estimates.get(id);
+    const links = adLinks.get(id);
+    const pin = pins.get(id) ?? null;
     const listing = {
       id, district: row['서울자치구'] ?? '', name: row['단지'] || '단지명 미확인',
       price: number(row['매도호가_억']), area: number(row['전용면적_㎡']),
       score: number(score?.['투자 적합도 100']), confidence: number(score?.['근거 신뢰도 100']),
-      pin: pins.get(id) ?? null,
+      pin, location: pin ? { point: pin, precision: '검증 건물', area: '' } :
+        estimate(mapRow, '좌표 정밀도', '지도표시주소(매물주소 아님)'),
+      neighborhood: mapRow?.['기준법정동'] || '',
+      floor: row['층'] || '', saleStatus: row['실제 판매 확인'] || '',
+      checked: row['조사 확인일'] || '',
+      adUrl: link(row['원문매물링크'], adHost) ?? link(links?.['원본광고(해당 매물 직접)'], adHost),
+      notionUrl: link(row['노션 상세'], notionHost) ?? link(mapRow?.['노션 상세URL'], notionHost),
+      searchUrl: link(links?.['네이버 개별매물 검색(미확인)'], host => host === 'search.naver.com'),
     };
     unique.set(id, { ...listing, revision: hash(listing) });
   }
@@ -86,11 +129,17 @@ export function projectLedger([raw, ranking, locations, zoneLedger]) {
   for (const row of rows(zoneLedger.values, ['정비사업키', '자치구', '사업명', '사업유형', '경계 파일 확보'])) {
     const id = String(row['정비사업키'] ?? '').trim();
     if (!id || zones.has(id)) continue;
+    const mapRow = projectPoints.get(id);
     zones.set(id, {
+      id,
       district: String(row['자치구'] ?? '').trim(),
       name: String(row['사업명'] ?? '').replace(/^\s*[^[]*\[정비사업\]\s*/, '').trim(),
       type: String(row['사업유형'] ?? '').trim(),
       boundaryStatus: row['경계 파일 확보'] === '도형 미확보' ? '도형 미확보' : '출처 확인 필요',
+      location: estimate(mapRow, '위치정밀도', '지도 대표주소'),
+      stage: mapRow?.['기존조사단계'] || '',
+      notionUrl: link(mapRow?.['원본 노션URL'], notionHost),
+      officialUrl: link(mapRow?.['공개 근거URL'], officialHost),
     });
   }
   const projects = [...zones.values()];
@@ -98,7 +147,9 @@ export function projectLedger([raw, ranking, locations, zoneLedger]) {
     listings, fetchedAt: new Date().toISOString(),
     projects, projectRevision: hash(projects),
     counts: { raw: rawCount, unique: listings.length, duplicates: rawCount - listings.length,
-      pins: listings.filter((row) => row.pin).length },
+      pins: listings.filter((row) => row.pin).length,
+      listingLocations: listings.filter((row) => row.location).length,
+      projectLocations: projects.filter((row) => row.location).length },
   };
 }
 

@@ -3,18 +3,22 @@ function dashboard() {
   const state = new Map();
   const canvas = byId('map');
   const ctx = canvas.getContext('2d');
-  const zoom = 11;
+  let zoom = 11;
   function project(lat, lng) {
     const size = 256 * 2 ** zoom;
     const rad = lat * Math.PI / 180;
     return [(lng + 180) / 360 * size, (1 - Math.asinh(Math.tan(rad)) / Math.PI) / 2 * size];
   }
-  const [centerX, centerY] = project(37.56, 126.98);
-  const x0 = Math.floor(centerX - canvas.width / 2);
-  const y0 = Math.floor(centerY - canvas.height / 2);
-  const tiles = [];
+  let [centerX, centerY] = project(37.56, 126.98);
+  let x0, y0;
+  const tiles = new Map();
+  let visibleTiles = [];
   let displayed = [];
   let projects = [];
+  let displayedProjects = [];
+  let selection;
+  let saved = new Set();
+  try { saved = new Set(JSON.parse(localStorage.getItem('radar-saved-listings') || '[]')); } catch {}
   let projectRevision;
   let syncing = false;
   let lastAttempt = 0;
@@ -22,28 +26,151 @@ function dashboard() {
   function draw() {
     ctx.fillStyle = '#e7eeeb';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-    for (const { img, x, y } of tiles) {
+    for (const { img, x, y } of visibleTiles) {
       if (img.naturalWidth) ctx.drawImage(img, x * 256 - x0, y * 256 - y0);
     }
-    for (const ad of displayed) {
-      if (!ad.pin) continue;
-      const [x, y] = project(...ad.pin);
-      ctx.beginPath();
-      ctx.arc(x - x0, y - y0, 5, 0, Math.PI * 2);
-      ctx.fillStyle = '#0a664b';
-      ctx.fill();
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = '#fff';
-      ctx.stroke();
-    }
   }
-  for (let x = Math.floor(x0 / 256); x * 256 < x0 + canvas.width; x += 1) {
-    for (let y = Math.floor(y0 / 256); y * 256 < y0 + canvas.height; y += 1) {
-      const img = new Image();
-      tiles.push({ img, x, y });
-      img.onload = draw;
-      img.src = 'https://tile.openstreetmap.org/' + zoom + '/' + x + '/' + y + '.png';
+  function mapItems() {
+    return [
+      ...(byId('showAds').checked ? displayed.filter(row => row.location).map(row => ({ row, kind: 'ad' })) : []),
+      ...(byId('showProjects').checked ? displayedProjects.filter(row => row.location).map(row => ({ row, kind: 'project' })) : []),
+    ];
+  }
+  function textNode(tag, value, className) {
+    const el = document.createElement(tag);
+    el.textContent = value;
+    if (className) el.className = className;
+    return el;
+  }
+  function action(label, fn, className = 'secondary') {
+    const button = textNode('button', label, className);
+    button.type = 'button';
+    button.addEventListener('click', fn);
+    return button;
+  }
+  function external(label, url) {
+    const anchor = textNode('a', label);
+    anchor.href = url;
+    anchor.target = '_blank';
+    anchor.rel = 'noopener noreferrer';
+    return anchor;
+  }
+  function showDetail(row, kind) {
+    selection = { id: row.id, kind };
+    const box = byId('detail');
+    const info = kind === 'ad'
+      ? [row.district, row.neighborhood, row.floor, row.price === null ? null : row.price + '억', row.area === null ? null : row.area + '㎡']
+      : [row.district, row.type, row.stage, row.boundaryStatus];
+    const precision = row.location ? [row.location.precision, row.location.area].filter(Boolean).join(' · ') : '지도 위치 미확보';
+    box.replaceChildren(textNode('h3', row.name), textNode('p', info.filter(Boolean).join(' · '), 'meta'),
+      textNode('p', precision, 'precision'));
+    if (kind === 'ad') {
+      const status = [row.saleStatus, row.checked && '조사 ' + row.checked].filter(Boolean).join(' · ');
+      if (status) box.append(textNode('p', status, 'meta'));
     }
+    const links = textNode('div', '', 'links');
+    if (row.adUrl) links.append(external('광고 원문', row.adUrl));
+    if (row.notionUrl) links.append(external('Notion 상세', row.notionUrl));
+    if (row.searchUrl) links.append(external('유사 매물 검색', row.searchUrl));
+    if (row.officialUrl) links.append(external('공식 근거', row.officialUrl));
+    if (kind === 'project') links.append(external('서울플랜+에서 경계 확인', byId('officialMapLink').href));
+    if (kind === 'ad') {
+      links.append(action(saved.has(row.id) ? '관심 해제' : '관심 매물 저장', () => {
+        if (saved.has(row.id)) saved.delete(row.id);
+        else saved.add(row.id);
+        try { localStorage.setItem('radar-saved-listings', JSON.stringify([...saved])); } catch {}
+        renderRows();
+        refreshMap();
+        showDetail(row, kind);
+      }));
+    }
+    if (row.location) links.append(action('지도에서 보기', () => {
+      if (!byId(kind === 'ad' ? 'showAds' : 'showProjects').checked) byId(kind === 'ad' ? 'showAds' : 'showProjects').checked = true;
+      zoom = Math.max(zoom, 13);
+      [centerX, centerY] = project(...row.location.point);
+      refreshMap();
+      byId('mapPanel').scrollIntoView({ block: 'nearest' });
+    }));
+    box.append(links);
+  }
+  function showGroup(items) {
+    const box = byId('group');
+    box.hidden = items.length < 2;
+    box.replaceChildren();
+    if (items.length > 1) {
+      box.append(textNode('h3', '이 위치의 매물·사업 ' + items.length + '건'));
+      for (const { row, kind } of items) {
+        box.append(action((kind === 'ad' ? '매물 · ' : '사업 · ') + row.name, () => showDetail(row, kind), 'rowLink'));
+      }
+    }
+    showDetail(items[0].row, items[0].kind);
+  }
+  function refreshMap() {
+    x0 = Math.floor(centerX - canvas.width / 2);
+    y0 = Math.floor(centerY - canvas.height / 2);
+    visibleTiles = [];
+    for (let x = Math.floor(x0 / 256); x * 256 < x0 + canvas.width; x += 1) {
+      for (let y = Math.floor(y0 / 256); y * 256 < y0 + canvas.height; y += 1) {
+        const key = [zoom, x, y].join('/');
+        if (!tiles.has(key)) {
+          const img = new Image();
+          img.onload = draw;
+          img.src = 'https://tile.openstreetmap.org/' + key + '.png';
+          tiles.set(key, { img, x, y });
+        }
+        visibleTiles.push(tiles.get(key));
+      }
+    }
+    while (tiles.size > 80) tiles.delete(tiles.keys().next().value);
+    draw();
+    const items = mapItems();
+    const groups = new Map();
+    const fragment = document.createDocumentFragment();
+    for (const item of items) {
+      const [worldX, worldY] = project(...item.row.location.point);
+      const x = worldX - x0;
+      const y = worldY - y0;
+      if (x < 12 || x > canvas.width - 12 || y < 12 || y > canvas.height - 12) continue;
+      const key = Math.round(x / 38) + '/' + Math.round(y / 38);
+      if (!groups.has(key)) groups.set(key, { x, y, members: [] });
+      groups.get(key).members.push(item);
+    }
+    for (const { x, y, members } of groups.values()) {
+      const one = members[0];
+      const kind = members.length > 1 ? 'cluster' : one.kind === 'project' ? 'project' : one.row.pin ? 'verified' : 'estimate';
+      const marker = action(members.length > 1 ? members.length : one.kind === 'project' ? '사' : '매',
+        () => showGroup(members), 'marker ' + kind);
+      marker.style.left = (x / canvas.width * 100) + '%';
+      marker.style.top = (y / canvas.height * 100) + '%';
+      marker.title = members.length > 1 ? '가까운 매물·사업 ' + members.length + '건' : one.row.name + ' · ' + one.row.location.precision;
+      marker.setAttribute('aria-label', marker.title);
+      fragment.append(marker);
+    }
+    byId('markers').replaceChildren(fragment);
+    const shown = [...groups.values()].flatMap(g => g.members);
+    byId('pinStatus').textContent = '지도 범위 내 매물 ' + shown.filter(x => x.kind === 'ad').length +
+      '건 · 정비사업 ' + shown.filter(x => x.kind === 'project').length + '건 · 검증 건물 ' +
+      shown.filter(x => x.row.pin).length + '건';
+    byId('zoomIn').disabled = zoom >= 15;
+    byId('zoomOut').disabled = zoom <= 10;
+  }
+  function fitMap() {
+    const items = mapItems();
+    if (!items.length) { refreshMap(); return; }
+    zoom = 13;
+    const bounds = () => {
+      const points = items.map(({ row }) => project(...row.location.point));
+      const xs = points.map(p => p[0]), ys = points.map(p => p[1]);
+      return [Math.min(...xs), Math.max(...xs), Math.min(...ys), Math.max(...ys)];
+    };
+    let box = bounds();
+    while (zoom > 10 && (box[1] - box[0] > canvas.width - 100 || box[3] - box[2] > canvas.height - 100)) {
+      zoom -= 1;
+      box = bounds();
+    }
+    centerX = (box[0] + box[1]) / 2;
+    centerY = (box[2] + box[3]) / 2;
+    refreshMap();
   }
   function renderRows() {
     const district = byId('district').value;
@@ -51,18 +178,24 @@ function dashboard() {
     const budget = byId('budget').valueAsNumber;
     displayed = [...state.values()].filter((ad) =>
       (!district || district === ad.district) &&
+      (!byId('savedOnly').checked || saved.has(ad.id)) &&
       (!term || [ad.name, ad.district, ad.id].some((value) => String(value).toLowerCase().includes(term))) &&
       (!Number.isFinite(budget) || (ad.price !== null && ad.price <= budget)));
     displayed.sort((a, b) => (b.score ?? -1) - (a.score ?? -1));
-    draw();
     const priced = displayed.filter((ad) => ad.price !== null);
     const average = priced.length ? (priced.reduce((sum, ad) => sum + ad.price, 0) / priced.length).toFixed(2) + '억' : '—';
     byId('results').textContent = displayed.length + '건 · 평균 관찰호가 ' + average;
-    byId('pinStatus').textContent = '검색 결과 내 검증된 건물 핀 ' + displayed.filter((ad) => ad.pin).length + '건';
     const fragment = document.createDocumentFragment();
     for (const ad of displayed) {
       const tr = document.createElement('tr');
-      for (const value of [ad.name, ad.district || '—', ad.price ?? '—', ad.area ?? '—', ad.score ?? '—', ad.confidence ?? '—']) {
+      const name = document.createElement('td');
+      name.append(action((saved.has(ad.id) ? '★ ' : '') + ad.name, () => {
+        byId('group').hidden = true;
+        showDetail(ad, 'ad');
+        byId('detail').scrollIntoView({ block: 'nearest' });
+      }, 'rowLink'));
+      tr.append(name);
+      for (const value of [ad.district || '—', ad.price ?? '—', ad.area ?? '—', ad.score ?? '—', ad.confidence ?? '—']) {
         const td = document.createElement('td');
         td.textContent = value;
         tr.append(td);
@@ -74,14 +207,21 @@ function dashboard() {
   function renderProjects() {
     const district = byId('district').value;
     const term = byId('projectSearch').value.trim().toLowerCase();
-    const visible = projects.filter((project) =>
+    displayedProjects = projects.filter((project) =>
       (!district || district === project.district) &&
       (!term || [project.name, project.type].some((value) => value.toLowerCase().includes(term))));
-    byId('projectStatus').textContent = '표시 ' + visible.length + '건 / 원장 ' + projects.length + '건';
+    byId('projectStatus').textContent = '표시 ' + displayedProjects.length + '건 / 원장 ' + projects.length + '건';
     const fragment = document.createDocumentFragment();
-    for (const project of visible) {
+    for (const project of displayedProjects) {
       const tr = document.createElement('tr');
-      for (const value of [project.name, project.district, project.type, project.boundaryStatus]) {
+      const name = document.createElement('td');
+      name.append(action(project.name, () => {
+        byId('group').hidden = true;
+        showDetail(project, 'project');
+        byId('detail').scrollIntoView({ block: 'nearest' });
+      }, 'rowLink'));
+      tr.append(name);
+      for (const value of [project.district, project.type, project.boundaryStatus]) {
         const td = document.createElement('td');
         td.textContent = value || '—';
         tr.append(td);
@@ -104,6 +244,7 @@ function dashboard() {
       if (response.status === 401) { location.reload(); return; }
       if (!response.ok) throw new Error();
       const payload = await response.json();
+      const firstLoad = !projectRevision;
       const { changed, removed, counts, fetchedAt } = payload;
       if (payload.projects) projects = payload.projects;
       projectRevision = payload.projectRevision;
@@ -111,8 +252,22 @@ function dashboard() {
       for (const ad of changed) state.set(ad.id, ad);
       byId('status').textContent = '원문 ' + counts.raw + '행 · 고유 ' + counts.unique + '건 · 중복 ' +
         counts.duplicates + '행 · ' + new Date(fetchedAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' }) + ' 원장 조회';
-      renderRows();
-      renderProjects();
+      const changedMap = firstLoad || changed.length || removed.length || payload.projects;
+      if (changedMap) {
+        renderRows();
+        renderProjects();
+        byId('group').hidden = true;
+        if (firstLoad) fitMap();
+        else refreshMap();
+      }
+      if (selection && changedMap) {
+        const row = selection.kind === 'ad' ? state.get(selection.id) : projects.find(project => project.id === selection.id);
+        if (row) showDetail(row, selection.kind);
+        else {
+          selection = undefined;
+          byId('detail').textContent = '선택한 항목이 원장에서 사라졌습니다.';
+        }
+      }
     } catch {
       byId('status').textContent = state.size ? '원장에 연결할 수 없습니다. 마지막 조회 결과를 표시합니다.' : '원장에 연결할 수 없습니다.';
     } finally {
@@ -123,9 +278,41 @@ function dashboard() {
   function refreshWhenVisible() {
     if (!document.hidden && Date.now() - lastAttempt >= refreshIntervalMs) sync();
   }
-  for (const id of ['district', 'search', 'budget']) byId(id).addEventListener('input', renderRows);
-  byId('district').addEventListener('input', renderProjects);
-  byId('projectSearch').addEventListener('input', renderProjects);
+  function applyFilters() {
+    renderRows();
+    renderProjects();
+    byId('group').hidden = true;
+    fitMap();
+  }
+  for (const id of ['district', 'search', 'budget', 'savedOnly', 'projectSearch', 'showAds', 'showProjects']) {
+    byId(id).addEventListener('input', applyFilters);
+  }
+  function changeZoom(step) {
+    zoom += step;
+    centerX *= 2 ** step;
+    centerY *= 2 ** step;
+    refreshMap();
+  }
+  byId('zoomIn').addEventListener('click', () => changeZoom(1));
+  byId('zoomOut').addEventListener('click', () => changeZoom(-1));
+  byId('fitMap').addEventListener('click', fitMap);
+  let drag;
+  canvas.addEventListener('pointerdown', (event) => {
+    if (!event.isPrimary || event.button !== 0) return;
+    drag = [event.clientX, event.clientY];
+    canvas.setPointerCapture(event.pointerId);
+  });
+  canvas.addEventListener('pointercancel', () => { drag = undefined; });
+  canvas.addEventListener('pointerup', (event) => {
+    if (!drag) return;
+    const scale = canvas.width / canvas.getBoundingClientRect().width;
+    const [left, bottom] = project(37.37, 126.67);
+    const [right, top] = project(37.78, 127.28);
+    centerX = Math.max(left, Math.min(right, centerX - (event.clientX - drag[0]) * scale));
+    centerY = Math.max(top, Math.min(bottom, centerY - (event.clientY - drag[1]) * scale));
+    drag = undefined;
+    refreshMap();
+  });
   byId('openOfficialMap').addEventListener('click', (event) => {
     const link = byId('officialMapLink');
     const frame = document.createElement('iframe');
@@ -140,7 +327,7 @@ function dashboard() {
   document.addEventListener('visibilitychange', refreshWhenVisible);
   window.addEventListener('online', refreshWhenVisible);
   window.setInterval(refreshWhenVisible, refreshIntervalMs);
-  draw();
+  refreshMap();
   sync();
 }
 
@@ -157,6 +344,20 @@ button{background:#0b654c;color:white;cursor:pointer;border-color:#0b654c}button
 .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);gap:16px}
 .meta{color:#526b60;margin:8px 0}.error{color:#a02525;margin-top:8px}
 canvas{display:block;width:100%;height:auto;border-radius:10px}a{color:#135340}
+.mapFrame{position:relative;isolation:isolate}canvas{cursor:grab;touch-action:none}
+.mapTools,.legend{display:flex;align-items:center;flex-wrap:wrap;gap:8px 12px;margin:8px 0}
+.mapTools label,.filters label.check{display:flex;align-items:center;gap:5px}
+.filters label.check input{width:auto}
+.marker{position:absolute;transform:translate(-50%,-50%);min-width:25px;height:25px;padding:0 5px;border:2px solid white;border-radius:50%;box-shadow:0 1px 5px #243b30aa;z-index:1;font-size:12px;font-weight:750}
+.marker:focus-visible,.marker:hover{z-index:3;outline:2px solid #172c38;outline-offset:2px}
+.estimate{background:#96601a}.verified{background:#12654f}.project{background:#3c54a0}.cluster{background:#263b4d}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px}
+.secondary{background:#edf5f0;color:#174e3e;border-color:#abc4b7}
+.rowLink{background:none;color:#135340;border:none;padding:2px;text-align:left;text-decoration:underline;text-underline-offset:2px}
+.detail,.group{background:#f1f6f3;border-radius:10px;padding:11px;margin-top:12px}
+.detail h3,.group h3{margin:0;font-size:16px}.detail .links{margin-bottom:0}
+.group{max-height:168px;overflow:auto}.group button{display:block}
+.precision{color:#805218;font-weight:600}
 iframe{display:block;width:100%;height:540px;border:1px solid #d8e4dc;border-radius:10px;margin-top:12px}
 .links{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:12px 0}
 .project-filter{max-width:420px}
@@ -174,14 +375,26 @@ export function render(nonce, mode, message = '') {
     <label>자치구<select id="district"><option value="">서울 전체</option>${districts.map((district) => '<option>' + district + '</option>').join('')}</select></label>
     <label>단지명·광고키<input id="search" type="search"></label>
     <label>최대 관찰호가 (억)<input id="budget" type="number" min="0" step="0.1"></label>
+    <label class="check"><input id="savedOnly" type="checkbox"> 관심 매물만</label>
     <button id="refresh" type="button">원장 새로고침</button>
   </div><p class="meta" id="status" role="status"></p><small>이 화면이 열려 있는 동안 2분마다 원장을 확인합니다.</small></section>
   <div class="grid">
-    <section><h2>서울 지도</h2><p class="meta" id="pinStatus">좌표 조회 중</p>
-      <canvas id="map" width="720" height="540" aria-label="검증된 건물 위치 지도"></canvas>
-      <small>© <a href="https://www.openstreetmap.org/copyright" rel="noreferrer">OpenStreetMap</a> · 정비사업 경계는 아래 서울시 공식 지도에서 확인할 수 있습니다.</small>
+    <section id="mapPanel"><h2>서울 매물·정비사업 지도</h2>
+      <div class="mapTools">
+        <label><input id="showAds" type="checkbox" checked> 매물</label>
+        <label><input id="showProjects" type="checkbox" checked> 정비사업</label>
+        <button id="zoomIn" class="secondary" type="button" aria-label="지도 확대">+</button>
+        <button id="zoomOut" class="secondary" type="button" aria-label="지도 축소">−</button>
+        <button id="fitMap" class="secondary" type="button">검색 범위 맞춤</button>
+      </div>
+      <p class="meta" id="pinStatus" role="status">좌표 조회 중</p>
+      <div class="mapFrame"><canvas id="map" width="780" height="550" aria-label="서울 매물·정비사업 지도. 마커 또는 매물 목록을 선택하세요."></canvas><div id="markers" aria-label="지도 마커"></div></div>
+      <div class="legend"><small><i class="estimate"></i>추정 매물</small><small><i class="project"></i>사업 대표 위치</small><small><i class="verified"></i>검증 건물</small><small><i class="cluster"></i>가까운 항목 묶음</small></div>
+      <small>동·구 중심 추정 핀으로 실건물 위치나 구역 편입을 판단할 수 없습니다. © <a href="https://www.openstreetmap.org/copyright" rel="noreferrer">OpenStreetMap</a> contributors</small>
+      <div id="group" class="group" hidden></div>
+      <div id="detail" class="detail" aria-live="polite">핀이나 목록을 선택하면 상세 정보가 표시됩니다.</div>
     </section>
-    <section><h2>매물 검색·분석</h2><p class="meta" id="results"></p><p class="meta">투자 적합도와 근거 신뢰도는 사전 검토 지표입니다.</p>
+    <section><h2>매물 검색·분석</h2><p class="meta" id="results"></p><p class="meta">관심 매물은 현재 브라우저에 저장됩니다. 투자 적합도와 근거 신뢰도는 사전 검토 지표입니다.</p>
       <div class="scroll"><table><thead><tr><th>단지</th><th>자치구</th><th>호가(억)</th><th>전용㎡</th><th>적합도</th><th>신뢰도</th></tr></thead><tbody id="rows"></tbody></table></div>
     </section>
   </div>

@@ -120,6 +120,7 @@ export function projectLedger([raw, ranking, locations, zoneLedger, adMap, proje
       checked: row['조사 확인일'] || '',
       adUrl: link(row['원문매물링크'], adHost) ?? link(links?.['원본광고(해당 매물 직접)'], adHost),
       notionUrl: link(row['노션 상세'], notionHost) ?? link(mapRow?.['노션 상세URL'], notionHost),
+      naverUrl: link(links?.['네이버 동일매물 직접링크(검증시)'], host => /(^|\.)land\.naver\.com$/.test(host)),
       searchUrl: link(links?.['네이버 개별매물 검색(미확인)'], host => host === 'search.naver.com'),
     };
     unique.set(id, { ...listing, revision: hash(listing) });

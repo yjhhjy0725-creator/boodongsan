@@ -71,6 +71,7 @@ function dashboard() {
     const links = textNode('div', '', 'links');
     if (row.adUrl) links.append(external('광고 원문', row.adUrl));
     if (row.notionUrl) links.append(external('Notion 상세', row.notionUrl));
+    if (row.naverUrl) links.append(external('네이버 동일 매물', row.naverUrl));
     if (row.searchUrl) links.append(external('유사 매물 검색', row.searchUrl));
     if (row.officialUrl) links.append(external('공식 근거', row.officialUrl));
     if (kind === 'project') links.append(external('서울플랜+에서 경계 확인', byId('officialMapLink').href));
@@ -92,6 +93,33 @@ function dashboard() {
       byId('mapPanel').scrollIntoView({ block: 'nearest' });
     }));
     box.append(links);
+    const mapLinks = textNode('div', '', 'links');
+    if (row.location) {
+      const [lat, lng] = row.location.point;
+      mapLinks.append(external('네이버부동산 주변 매물', 'https://new.land.naver.com/complexes?ms=' +
+        lat + ',' + lng + ',18&a=APT:OPST:ABYG:OBYG:GM:TJ:GSM:TGB:JW'));
+    }
+    mapLinks.append(external('아실 실거래가 열기', 'https://asil.kr/asil/index.jsp'));
+    const searchField = document.createElement('input');
+    searchField.type = 'text';
+    searchField.readOnly = true;
+    searchField.value = row.name;
+    searchField.setAttribute('aria-label', '아실 검색어');
+    searchField.hidden = true;
+    mapLinks.append(action('아실 검색어 복사', async (event) => {
+      try {
+        await navigator.clipboard.writeText(row.name);
+        event.target.textContent = '검색어 복사됨';
+      } catch {
+        searchField.hidden = false;
+        searchField.focus();
+        searchField.select();
+      }
+    }), searchField);
+    box.append(mapLinks);
+    if (row.location && row.location.precision !== '검증 건물') {
+      box.append(textNode('small', '네이버 지도는 동·구 중심 추정 위치 주변을 엽니다.', 'meta'));
+    }
   }
   function showGroup(items) {
     const box = byId('group');

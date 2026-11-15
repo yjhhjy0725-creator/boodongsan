@@ -1,6 +1,6 @@
 # RADAR 부동산 통합관리
 
-운영 프로젝트는 Vercel의 `radar-private`입니다. 현재는 이 디렉터리 안의 앱 파일을 프로젝트 루트로 직접 배포합니다. 기존 저장소에 Git 배포를 연결할 때는 앱 폴더인 `radar-private`를 루트로 지정해야 합니다.
+운영 프로젝트는 Vercel의 `radar-private`입니다. 이 디렉터리 안의 앱 파일을 프로젝트 루트로 직접 배포합니다. Git 빌드는 `radar-private-staging` 브랜치의 `radar-private` 폴더를 사용하며, 운영 설정은 별도 프로젝트에 있습니다.
 
 | 서버 환경 변수 | 설정값 |
 | --- | --- |
